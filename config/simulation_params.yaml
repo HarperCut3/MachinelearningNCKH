@@ -1,0 +1,47 @@
+# ============================================================================
+# Simulation & Policy Parameters
+# ============================================================================
+# Central configuration for all business assumptions used by the Monte Carlo
+# simulator (src/simulator.py) and the policy engine (src/policy.py).
+#
+# Analysts can adjust these values without modifying source code.
+# ============================================================================
+
+# ── Policy Engine (src/policy.py) ─────────────────────────────────────────────
+policy:
+  hazard_threshold: 0.01       # h(t) per day — above this → high risk
+  survival_floor: 0.05         # S(t) below this → customer is LOST
+  response_rate: 0.15          # 15% assumed email response/conversion rate
+  cost_per_contact: 1.0        # £1.00 GBP per outreach contact
+
+# ── Monte Carlo Simulator (src/simulator.py) ──────────────────────────────────
+monte_carlo:
+  n_iterations: 1000           # number of stochastic draws
+
+  # Response rate uncertainty: sample ~ N(mu, sigma), clipped to [0, 1]
+  response_rate_mean: 0.15
+  response_rate_std: 0.03
+
+  # Cost per contact uncertainty: sample ~ max(N(mu, sigma), 0.1)
+  cost_mean: 1.0
+  cost_std: 0.10
+
+  # RFM baseline: intervene on top X% customers by Monetary
+  rfm_top_pct: 0.40            # top 40%
+
+# ── Feature Engineering (src/feature_engine.py) ──────────────────────────────
+feature_engineering:
+  default_tau: 90              # inactivity threshold in days for churn definition
+
+# ── Economic Reality Constraints (Phase 10) ───────────────────────────────────
+simulation:
+  marketing_budget: 500.0      # Maximum £ we can spend on contacts per campaign
+  sleeping_dog_penalty: 0.20   # 20% of Monetary lost if we spam a low-hazard customer
+                               # (brand damage / annoyance churn proxy)
+
+# ── Economic Context (for reporting) ──────────────────────────────────────────
+economics:
+  currency: GBP
+  currency_symbol: "£"
+  avg_margin_pct: 0.30         # average profit margin on products (30%)
+  customer_acquisition_cost: 25.0  # estimated CAC in GBP

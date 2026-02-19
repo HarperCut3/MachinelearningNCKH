@@ -1,0 +1,47 @@
+# .dockerignore
+# Exclude large data files and generated outputs from Docker build context
+
+# Data files (mount as volumes instead)
+data/
+*.xlsx
+*.csv
+
+# Generated outputs (mount as volumes instead)
+outputs/
+
+# MLflow runs
+mlruns/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# AI assistant
+.gemini/

@@ -11,6 +11,8 @@ Features:
   - INTERVENE / WAIT / LOST recommendation with EVI
   - Individual survival and hazard curves with current-recency marker
   - Portfolio-level metrics and segment distribution
+  - 🧠 Explainable AI (SHAP Risk Breakdown) per customer
+  - 📊 Monte Carlo Policy Simulation confidence intervals
 
 Usage:
   streamlit run app.py
@@ -117,6 +119,18 @@ st.markdown("""
         margin-bottom: 16px;
     }
 
+    /* CI box */
+    .ci-box {
+        background: linear-gradient(135deg, #0d1f2d, #0a2e40);
+        border: 1px solid #1a5f7a;
+        border-radius: 12px;
+        padding: 16px 20px;
+        text-align: center;
+    }
+    .ci-label { font-size: 0.7rem; color: #8892b0; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+    .ci-median { font-size: 1.6rem; font-weight: 700; color: #64ffda; }
+    .ci-range  { font-size: 0.75rem; color: #8892b0; margin-top: 2px; }
+
     /* Streamlit metric override */
     [data-testid="stMetricValue"] { font-size: 1.5rem !important; }
 </style>
@@ -124,25 +138,56 @@ st.markdown("""
 
 
 # ── Data Loading (cached) ─────────────────────────────────────────────────────
+
+def get_available_runs() -> list:
+    """Scan outputs/ directory for available run folders (e.g. UCI_tau90)."""
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    if not os.path.exists(base_dir):
+        return []
+    
+    runs = []
+    try:
+        for d in os.listdir(base_dir):
+            if os.path.isdir(os.path.join(base_dir, d)) and "tau" in d:
+                runs.append(d)
+    except Exception:
+        pass
+        
+    return sorted(runs, reverse=True)  # Newest (by name if timestamped) or Alphabetical
+
+
 @st.cache_resource(show_spinner="Loading models...")
-def load_artifacts():
-    """Load all serialized artifacts from outputs/models/."""
+def load_artifacts(run_dir_name: str):
+    """Load all serialized artifacts from outputs/{run_dir_name}/models/."""
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(base_path, "outputs", run_dir_name, "models")
+    
     required = [
         "weibull_model.pkl", "preprocessor.pkl",
         "processed_data.pkl", "pipeline_meta.pkl",
     ]
-    missing = [f for f in required if not os.path.exists(os.path.join(MODELS_DIR, f))]
+    
+    if not os.path.exists(models_dir):
+        return None, None, None, None, None, f"Models directory not found: {models_dir}"
+
+    missing = [f for f in required if not os.path.exists(os.path.join(models_dir, f))]
     if missing:
-        return None, None, None, None, f"Missing model files: {missing}"
+        return None, None, None, None, None, f"Missing model files in {run_dir_name}: {missing}"
 
     try:
-        waf        = joblib.load(os.path.join(MODELS_DIR, "weibull_model.pkl"))
-        prep       = joblib.load(os.path.join(MODELS_DIR, "preprocessor.pkl"))
-        data       = joblib.load(os.path.join(MODELS_DIR, "processed_data.pkl"))
-        meta       = joblib.load(os.path.join(MODELS_DIR, "pipeline_meta.pkl"))
-        return waf, prep, data, meta, None
+        waf        = joblib.load(os.path.join(models_dir, "weibull_model.pkl"))
+        prep       = joblib.load(os.path.join(models_dir, "preprocessor.pkl"))
+        data       = joblib.load(os.path.join(models_dir, "processed_data.pkl"))
+        meta       = joblib.load(os.path.join(models_dir, "pipeline_meta.pkl"))
+
+        # Load scaled training data for SHAP background (optional)
+        df_scaled_path = os.path.join(models_dir, "df_scaled.pkl")
+        df_scaled = joblib.load(df_scaled_path) if os.path.exists(df_scaled_path) else None
+
+        return waf, prep, data, meta, df_scaled, None
     except Exception as e:
-        return None, None, None, None, str(e)
+        return None, None, None, None, None, str(e)
+
 
 
 # ── Policy Engine ─────────────────────────────────────────────────────────────
@@ -168,7 +213,7 @@ def compute_customer_risk(
     customer_row : pd.Series
         Single customer's raw features.
     survival_features : list
-        Feature column names used by the model.
+        Feature column names the model was trained on (VIF-pruned).
     t_eval : float
         Time point to evaluate (customer's current Recency in days).
     hazard_threshold : float
@@ -182,13 +227,13 @@ def compute_customer_risk(
     -------
     dict with keys: survival, hazard, evi, decision, t_eval, t_grid, S_curve, h_curve
     """
-    # Prepare scaled input
-    X_raw = customer_row[survival_features].values.reshape(1, -1)
+    # Prepare scaled input — strictly match the active_features list
+    X_raw    = customer_row[survival_features].values.reshape(1, -1)
     X_scaled = prep.transform(X_raw)
     df_input = pd.DataFrame(X_scaled, columns=survival_features)
 
     # Time grid for curves (0 to 400 days)
-    t_max = 400
+    t_max  = 400
     t_grid = np.linspace(1, t_max, 300)
 
     # Survival function S(t)
@@ -232,6 +277,212 @@ def compute_customer_risk(
     }
 
 
+def _build_shap_section(
+    waf,
+    prep,
+    customer_row: pd.Series,
+    survival_features: list,
+    df_scaled_bg,
+):
+    """
+    Render the SHAP Risk Breakdown expander section in Streamlit.
+
+    Strategy: wrap WeibullAFTFitter.predict_median() as a plain callable
+    so shap.Explainer can treat it as a black-box model.  SHAP values on the
+    predicted median survival time (log-scale) give an interpretable
+    decomposition: a high positive SHAP value for a feature means that feature
+    *extended* the customer's predicted lifetime (lower risk), while negative
+    SHAP values compress it (higher risk).
+    """
+    with st.expander("🧠 Explainable AI (SHAP Risk Breakdown)", expanded=False):
+        try:
+            import shap  # lazy import — optional dependency
+        except ImportError:
+            st.warning(
+                "**SHAP not installed.** Run `pip install shap` then restart the app.",
+                icon="⚠️",
+            )
+            return
+
+        try:
+            # ── Prepare the background dataset ──────────────────────────────
+            if df_scaled_bg is not None and all(f in df_scaled_bg.columns for f in survival_features):
+                # Use a sample of 100 rows from the training set as background
+                bg_size  = min(100, len(df_scaled_bg))
+                bg_data  = df_scaled_bg[survival_features].sample(bg_size, random_state=42).values
+            else:
+                # Fallback: single zero-vector background
+                bg_data = np.zeros((1, len(survival_features)))
+
+            # ── Scale the selected customer ──────────────────────────────────
+            X_raw    = customer_row[survival_features].values.reshape(1, -1)
+            X_scaled = prep.transform(X_raw)
+
+            # ── Define black-box predict function ────────────────────────────
+            # Output: log(predicted_median) so SHAP values are additive on the
+            # log scale.  Positive SHAP ↑ → feature extends survival (lower risk).
+            def _predict_log_median(X: np.ndarray) -> np.ndarray:
+                df_in = pd.DataFrame(X, columns=survival_features)
+                medians = waf.predict_median(df_in)
+                return np.log1p(np.maximum(medians.values, 1e-6))
+
+            with st.spinner("Computing SHAP values…"):
+                explainer   = shap.Explainer(_predict_log_median, bg_data)
+                shap_values = explainer(X_scaled)
+
+            sv = shap_values.values[0]          # shape: (n_features,)
+            base_val = float(shap_values.base_values[0])
+
+            # ── Sort features by |SHAP| ──────────────────────────────────────
+            order     = np.argsort(np.abs(sv))
+            feat_names_sorted = [survival_features[i] for i in order]
+            sv_sorted         = sv[order]
+            colors            = ["#ff4444" if v < 0 else "#00cc66" for v in sv_sorted]
+
+            st.markdown(
+                "<p style='color:#8892b0; font-size:0.85rem;'>"
+                "SHAP values decompose <em>why</em> this customer's predicted "
+                "survival time is higher or lower. "
+                "🟢 = feature <b>extends</b> predicted lifetime (lower churn risk) | "
+                "🔴 = feature <b>compresses</b> lifetime (higher churn risk)."
+                "</p>",
+                unsafe_allow_html=True,
+            )
+
+            fig, ax = plt.subplots(figsize=(9, max(3, len(survival_features) * 0.55)))
+            fig.patch.set_facecolor("#0f1117")
+            ax.set_facecolor("#1a1d27")
+
+            bars = ax.barh(feat_names_sorted, sv_sorted, color=colors, edgecolor="#0f1117", linewidth=0.8)
+            ax.axvline(0, color="#8892b0", linewidth=0.8, linestyle="--")
+
+            for bar, val in zip(bars, sv_sorted):
+                x_pos  = bar.get_width() + (0.003 if val >= 0 else -0.003)
+                ha_val = "left" if val >= 0 else "right"
+                ax.text(
+                    x_pos, bar.get_y() + bar.get_height() / 2,
+                    f"{val:+.4f}", va="center", ha=ha_val,
+                    color="#ccd6f6", fontsize=8.5,
+                )
+
+            ax.set_xlabel("SHAP value  (impact on log predicted median survival)", color="#8892b0", fontsize=9)
+            ax.set_title(
+                f"SHAP Feature Contributions  |  Base value = {base_val:.4f}",
+                color="#ccd6f6", fontsize=10, fontweight="bold",
+            )
+            ax.tick_params(colors="#8892b0", labelsize=9)
+            for spine in ax.spines.values():
+                spine.set_color("#2e3250")
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+            plt.tight_layout()
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+            # Feature contribution table
+            shap_df = pd.DataFrame({
+                "Feature":        [survival_features[i] for i in np.argsort(np.abs(sv))[::-1]],
+                "Raw Value":      [float(customer_row[survival_features[i]]) for i in np.argsort(np.abs(sv))[::-1]],
+                "SHAP Value":     sorted(sv, key=abs, reverse=True),
+                "Direction":      ["🔴 Higher Risk" if v < 0 else "🟢 Lower Risk"
+                                   for v in sorted(sv, key=abs, reverse=True)],
+            })
+            st.dataframe(
+                shap_df.style.format({"Raw Value": "{:.4f}", "SHAP Value": "{:+.4f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        except Exception as exc:
+            st.error(f"SHAP computation failed: {exc}")
+            st.info("This may happen if the model artifacts are from an older run. Re-run `python main.py --no-shap` to refresh.")
+
+
+def _render_monte_carlo_section(mc: dict):
+    """Render the Monte Carlo Policy Simulation results panel."""
+    st.markdown("### 📊 Monte Carlo Policy Simulation — *Economic Reality Engine*")
+
+    budget   = mc.get("marketing_budget",    500.0)
+    penalty  = mc.get("sleeping_dog_penalty", 0.20)
+    n_iters  = mc.get("n_iterations",        1000)
+    st.markdown(
+        f"<p style='color:#8892b0; font-size:0.85rem; margin-top:-8px;'>"
+        f"{n_iters:,} iterations sampling uncertainty over response rate "
+        f"(<i>μ=15%, σ=3%</i>) and outreach cost (<i>μ=£1.00, σ=£0.10</i>). "
+        f"<b style='color:#ff9f43;'>Budget cap: £{budget:,.0f}/campaign.</b> "
+        f"RFM contacts with low hazard incur a "
+        f"<b style='color:#ff4444;'>{penalty:.0%} Sleeping Dog penalty</b> "
+        f"(brand-damage / annoyance churn). Reported as 95% Confidence Intervals."
+        f"</p>",
+        unsafe_allow_html=True,
+    )
+
+    w_ci      = mc.get("weibull_profit_ci",   (0, 0, 0))
+    r_ci      = mc.get("rfm_profit_ci",        (0, 0, 0))
+    eg_ci     = mc.get("efficiency_gain_ci",   (0, 0, 0))
+    n_w_pool  = mc.get("n_weibull_intervene",  "—")
+    n_w_fund  = mc.get("n_weibull_funded",     n_w_pool)
+    n_r_pool  = mc.get("n_rfm_intervene",      "—")
+    n_r_fund  = mc.get("n_rfm_funded",         n_r_pool)
+    n_sleep   = mc.get("n_rfm_sleeping_dogs",  "—")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown(
+            f"<div class='ci-box'>"
+            f"<div class='ci-label'>Weibull (Precision) — Total Profit</div>"
+            f"<div class='ci-median'>£{w_ci[1]:,.0f}</div>"
+            f"<div class='ci-range'>95% CI: £{w_ci[0]:,.0f} — £{w_ci[2]:,.0f}</div>"
+            f"<div class='ci-range' style='margin-top:6px; color:#64ffda;'>"
+            f"{n_w_fund:,} funded (pool: {n_w_pool:,})</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    with col2:
+        st.markdown(
+            f"<div class='ci-box'>"
+            f"<div class='ci-label'>RFM Baseline (Penalised) — Total Profit</div>"
+            f"<div class='ci-median'>£{r_ci[1]:,.0f}</div>"
+            f"<div class='ci-range'>95% CI: £{r_ci[0]:,.0f} — £{r_ci[2]:,.0f}</div>"
+            f"<div class='ci-range' style='margin-top:6px; color:#ff9f43;'>"
+            f"{n_r_fund:,} funded | "
+            f"<span style='color:#ff6b6b;'>⚠ {n_sleep:,} Sleeping Dogs</span></div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    with col3:
+        gain_pct_med = eg_ci[1] * 100
+        gain_color   = "#00cc66" if gain_pct_med >= 0 else "#ff4444"
+        st.markdown(
+            f"<div class='ci-box'>"
+            f"<div class='ci-label'>Weibull vs RFM — Efficiency Gain</div>"
+            f"<div class='ci-median' style='color:{gain_color};'>{gain_pct_med:+.1f}%</div>"
+            f"<div class='ci-range'>95% CI: {eg_ci[0]*100:+.1f}% — {eg_ci[2]*100:+.1f}%</div>"
+            f"<div class='ci-range' style='margin-top:6px;'>(per £ of budget spent)</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Summary callout
+    st.markdown("<br>", unsafe_allow_html=True)
+    desc = (
+        f"Under a **£{budget:,.0f} campaign budget**, Weibull precision targeting "
+        f"funds **{n_w_fund:,} high-risk customers** (EVI-ranked), earning "
+        f"**£{w_ci[1]:,.0f}** median profit. "
+        f"RFM funds **{n_r_fund:,} customers** but penalises **{n_sleep:,} Sleeping Dogs** "
+        f"({penalty:.0%} future value loss each), yielding only **£{r_ci[1]:,.0f}**. "
+        f"Median efficiency gain: **{gain_pct_med:+.1f}%**."
+    )
+    if gain_pct_med >= 0:
+        st.success(desc)
+    else:
+        st.warning(desc + " Consider lowering `hazard_threshold` to expand the INTERVENE pool.")
+
+
 def plot_individual_curves(result: dict, customer_id, recency: float) -> plt.Figure:
     """Plot survival and hazard curves for a single customer."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -243,7 +494,7 @@ def plot_individual_curves(result: dict, customer_id, recency: float) -> plt.Fig
     t_eval  = result["t_eval"]
 
     # Color by decision
-    color_map = {"INTERVENE": "#ff4444", "WAIT": "#00cc66", "LOST": "#888888"}
+    color_map  = {"INTERVENE": "#ff4444", "WAIT": "#00cc66", "LOST": "#888888"}
     curve_color = color_map.get(result["decision"], "#64ffda")
 
     # ── Survival Curve ────────────────────────────────────────────────────────
@@ -352,20 +603,107 @@ def plot_portfolio_overview(data: pd.DataFrame) -> plt.Figure:
     return fig
 
 
+# ── Uplift Analysis Panel ────────────────────────────────────────────────────
+def _render_uplift_section(run_dir_name: str):
+    """
+    Render the Uplift Modeling results panel.
+    Reads outputs/{run_dir_name}/reports/uplift_segments.csv.
+    """
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    UPLIFT_CSV = os.path.join(base_path, "outputs", run_dir_name, "reports", "uplift_segments.csv")
+    QINI_PNG   = os.path.join(base_path, "outputs", run_dir_name, "figures", "07_qini_curve.png")
+
+    with st.expander("🎯 Uplift Modeling — Persuadables Analysis (T-Learner)", expanded=False):
+        if not os.path.exists(UPLIFT_CSV):
+            st.info(
+                "Uplift analysis not yet run.\n\n"
+                "Run: `python main.py --no-shap --uplift` to generate Persuadables data."
+            )
+            return
+
+        try:
+            uplift_df = pd.read_csv(UPLIFT_CSV)
+
+        except Exception as exc:
+            st.error(f"Could not load uplift_segments.csv: {exc}")
+            return
+
+        st.markdown(
+            "<p style='color:#8892b0; font-size:0.85rem;'>"
+            "T-Learner CATE estimation (Gradient Boosting). Weibull INTERVENE decisions "
+            "used as treatment proxy. Customers split into 4 Radcliffe &amp; Surry (1999) quadrants."
+            "</p>",
+            unsafe_allow_html=True,
+        )
+
+        # Segment KPI cards
+        seg_counts = uplift_df["uplift_segment"].value_counts().to_dict()
+        seg_colors = {
+            "Persuadables":  "#00cc66",
+            "Sure Things":   "#4a9eff",
+            "Sleeping Dogs": "#ff9f43",
+            "Lost Causes":   "#888888",
+        }
+        total = len(uplift_df)
+        c1, c2, c3, c4 = st.columns(4)
+        for col, seg in zip([c1, c2, c3, c4],
+                            ["Persuadables", "Sure Things", "Sleeping Dogs", "Lost Causes"]):
+            n = seg_counts.get(seg, 0)
+            col.markdown(
+                f"<div style='background:linear-gradient(135deg,#0f1117,#1a1d27);"
+                f"border:1px solid {seg_colors[seg]}; border-radius:12px; padding:16px; text-align:center;'>"
+                f"<div style='color:{seg_colors[seg]}; font-size:0.75rem; font-weight:600;'>{seg.upper()}</div>"
+                f"<div style='font-size:1.6rem; font-weight:700; color:#e0e0e0;'>{n:,}</div>"
+                f"<div style='color:#8892b0; font-size:0.7rem;'>{n/total*100:.1f}% of portfolio</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        # Qini curve if available
+        if os.path.exists(QINI_PNG):
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.image(QINI_PNG, caption="Qini Curve — Uplift vs Random Targeting",
+                     use_container_width=True)
+
+        # Top Persuadables table
+        persuadables = uplift_df[uplift_df["uplift_segment"] == "Persuadables"].copy()
+        if not persuadables.empty:
+            st.markdown("**Top Persuadables (highest uplift estimate)**")
+            st.dataframe(
+                persuadables.sort_values("tau_hat", ascending=False)
+                .head(15)[["CustomerID", "tau_hat", "uplift_segment"]]
+                .rename(columns={"tau_hat": "CATE Estimate (τ̂)"})
+                .reset_index(drop=True),
+                use_container_width=True,
+            )
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 def main():
-    # Load artifacts
-    waf, prep, data, meta, error = load_artifacts()
-
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("## 📊 Decision Engine")
-        st.markdown("*Decision-Centric Customer Re-Engagement*")
+        st.caption("Decision-Centric Customer Re-Engagement")
+        
+        # Run Selection (Dynamic)
+        avail_runs = get_available_runs()
+        if not avail_runs:
+            st.error("No analysis runs found in `outputs/`. Run `python main.py` first.")
+            st.stop()
+
+        selected_run = st.selectbox(
+            "Select Analysis Run",
+            options=avail_runs,
+            index=0,
+            help="Select which dataset/configuration output to view."
+        )
         st.markdown("---")
 
+        # Load artifacts for selected run
+        waf, prep, data, meta, df_scaled, error = load_artifacts(selected_run)
+
         if error:
-            st.error(f"**Model not loaded:** {error}")
-            st.info("Run `python main.py --no-shap` first to generate model artifacts.")
+            st.error(f"**Error loading {selected_run}:**\n{error}")
             st.stop()
 
         st.success(f"**{meta['n_customers']:,} customers** loaded")
@@ -427,6 +765,22 @@ def main():
     )
     st.markdown("---")
 
+    # ── Resolve active feature list (crash-proofing) ──────────────────────────
+    # Use the VIF-pruned feature list saved during training.  Falls back to
+    # the full survival_features list (pre-Phase 4 artifacts), then to the
+    # hard-coded default.  This ensures the UI never passes a feature that
+    # was dropped by VIF pruning, which would cause a model input shape
+    # mismatch and crash the app.
+    _default_feats = [
+        "Recency", "Frequency", "Monetary",
+        "InterPurchaseTime", "GapDeviation", "SinglePurchase",
+    ]
+    survival_features = (
+        meta.get("active_features_waf")
+        or meta.get("survival_features")
+        or _default_feats
+    )
+
     # ── Customer Lookup ───────────────────────────────────────────────────────
     customer_mask = data["CustomerID"].astype(int) == customer_id
     if not customer_mask.any():
@@ -435,10 +789,15 @@ def main():
         st.stop()
 
     customer_row = data[customer_mask].iloc[0]
-    survival_features = meta.get("survival_features", [
-        "Recency", "Frequency", "Monetary",
-        "InterPurchaseTime", "GapStability", "SinglePurchase",
-    ])
+
+    # Validate that all active features are present in the loaded data
+    missing_feats = [f for f in survival_features if f not in customer_row.index]
+    if missing_feats:
+        st.error(
+            f"Loaded data is missing features: **{missing_feats}**. "
+            "Please re-run `python main.py --no-shap` to regenerate artifacts."
+        )
+        st.stop()
 
     # Compute risk at current recency
     recency = float(customer_row["Recency"])
@@ -464,11 +823,11 @@ def main():
 
     col1, col2, col3, col4, col5 = st.columns(5)
     metrics = [
-        (col1, "Recency",          f"{customer_row['Recency']:.0f}",       "days since last buy"),
-        (col2, "Frequency",        f"{customer_row['Frequency']:.0f}",      "total orders"),
-        (col3, "Monetary",         f"£{customer_row['Monetary']:,.0f}",     "total spend"),
-        (col4, "Survival T",       f"{customer_row['T']:.0f}",              "days observed"),
-        (col5, "RFM Segment",      customer_row.get("RFM_Segment", "N/A"),  ""),
+        (col1, "Recency",   f"{customer_row['Recency']:.0f}",       "days since last buy"),
+        (col2, "Frequency", f"{customer_row['Frequency']:.0f}",      "total orders"),
+        (col3, "Monetary",  f"£{customer_row['Monetary']:,.0f}",     "total spend"),
+        (col4, "Survival T", f"{customer_row['T']:.0f}",              "days observed"),
+        (col5, "RFM Segment", customer_row.get("RFM_Segment", "N/A"),  ""),
     ]
     for col, label, value, unit in metrics:
         with col:
@@ -534,7 +893,7 @@ def main():
         st.markdown("<div class='section-header'>Risk Metrics at Current Recency</div>", unsafe_allow_html=True)
 
         # Survival probability gauge
-        s_val = result["survival"]
+        s_val   = result["survival"]
         s_color = "#00cc66" if s_val > 0.5 else ("#ff9f43" if s_val > 0.2 else "#ff4444")
         st.metric(
             label=f"Survival Probability S({recency:.0f}d)",
@@ -572,6 +931,22 @@ def main():
     st.pyplot(fig_curves, use_container_width=True)
     plt.close(fig_curves)
 
+    st.markdown("---")
+
+    # ── SHAP Section ──────────────────────────────────────────────────────────
+    _build_shap_section(waf, prep, customer_row, survival_features, df_scaled)
+
+    st.markdown("---")
+
+    # ── Monte Carlo Policy Simulation ─────────────────────────────────────────
+    mc_results = meta.get("monte_carlo_results")
+    if mc_results:
+        _render_monte_carlo_section(mc_results)
+        st.markdown("---")
+
+    # ── Uplift Analysis ───────────────────────────────────────────────────────
+    # Pass the selected run directory so it knows where to look for CSVs
+    _render_uplift_section(selected_run)
     st.markdown("---")
 
     # ── Portfolio Overview ────────────────────────────────────────────────────

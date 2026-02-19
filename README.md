@@ -1,157 +1,193 @@
-# Decision-Centric Customer Re-Engagement
-### A Survival Analysis Approach in Retail E-Commerce
+# Decision-Centric Customer Retention
+### *Precision Survival Analysis & Uplift Modeling for E-Commerce*
 
-> **Weibull AFT model** to predict *when* customers will churn — not just *if* — enabling precision intervention timing over traditional RFM heuristics.
+Implementation of a **Weibull AFT model** to predict *when* customers will churn — not just *if* — enabling proactive, perfectly-timed re-engagement interventions.
 
 ---
 
-## Quick Start
+## 🚀 Overview
+Most churn models ask "Will this customer leave next month?". This framework asks **"When will this customer leave, and what is the optimal time to intervene?"**
 
+Key capabilities:
+- **Survival Analysis**: Weibull AFT model (C-index > 0.76) predicts exact churn timing.
+- **Uplift Modeling**: Uses T-Learner to identify "Persuadables" (customers who respond *only* if treated).
+- **Decision Engine**: Calculates Expected Value of Intervention (EVI) to maximize ROI.
+- **Interactive Dashboard**: Real-time risk profiling & portfolio management.
+
+---
+
+## ✨ Features
+- **Precision Targeting**: Intervene only when hazard is high AND projected ROI is positive.
+- **Explainable AI**: SHAP values explain *why* a customer is at risk.
+- **Multi-Dataset Support**: UCI Online Retail, Ta Feng Grocery, and CDNOW datasets.
+- **Cross-Validation**: Stratified K-Fold CV for survival model robustness.
+- **Experiment Tracking**: MLflow integration for model metrics & artifact logging.
+- **Comparison Reports**: Auto-generate cross-dataset performance comparisons.
+- **Dockerized**: Production-ready container support.
+- **Configurable**: Business rules centralized in YAML Configuration.
+
+---
+
+## 🛠️ Installation
+
+### 1. Prerequisites
+- Python 3.10+
+- Git
+
+### 2. Setup
 ```bash
-# 1. Clone the repo
+# Clone repository
 git clone https://github.com/HarperCut3/MachinelearningNCKH.git
 cd MachinelearningNCKH
 
-# 2. Install dependencies
+# Create virtual environment (recommended)
+python -m venv .venv
+# Activate: Windows -> .venv\Scripts\activate | Linux/Mac -> source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 
-# 3. Run the full pipeline (generates models + figures)
-python main.py --no-shap
-
-# 4. Launch the interactive dashboard
-streamlit run app.py
+# For development (Jupyter, pytest):
+pip install -r requirements-dev.txt
 ```
 
-> **Dataset required:** Place `Online Retail.xlsx` (UCI Online Retail Dataset) in the project root before running. Download from [UCI ML Repository](https://archive.ics.uci.edu/dataset/352/online+retail).
+### 3. Data Setup
+1. Download **Online Retail.xlsx** from [UCI ML Repository](https://archive.ics.uci.edu/dataset/352/online+retail).
+2. Place it in `data/raw/Online Retail.xlsx`.
 
 ---
 
-## Project Structure
+## 🚦 Usage
+
+### Run Pipeline
+```bash
+# Minimal run (fastest, ~2 mins)
+python main.py --no-shap --no-mlflow
+
+# Full run with SHAP analysis
+python main.py
+
+# Include Uplift Modeling (T-Learner)
+python main.py --uplift
+
+# Run on different datasets
+python main.py --dataset cdnow --tau 90
+python main.py --dataset tafeng --tau 60
+
+# Enable Cross-Validation (5-fold)
+python main.py --cv
+
+# Full run with all features
+python main.py --dataset uci --tau 90 --cv --uplift
+```
+
+### CLI Flags
+| Flag | Default | Description |
+|---|---|---|
+| `--dataset` | `uci` | Dataset to use: `uci`, `tafeng`, or `cdnow` |
+| `--tau` | `90` | Churn threshold in days |
+| `--cv` | off | Enable 5-fold stratified cross-validation |
+| `--uplift` | off | Enable T-Learner uplift modeling |
+| `--no-shap` | off | Skip SHAP computation (faster) |
+| `--no-mlflow` | off | Disable MLflow experiment tracking |
+
+### Launch Dashboard
+Start the interactive Streamlit app:
+```bash
+streamlit run app.py
+# Access at http://localhost:8501
+```
+
+### Generate Comparison Report
+Compare results across all dataset runs:
+```bash
+python src/comparison.py
+```
+
+---
+
+## 📂 Project Structure
 
 ```
 MachinelearningNCKH/
-├── Online Retail.xlsx          ← UCI dataset (not tracked in git)
-├── requirements.txt            ← Python dependencies
-├── main.py                     ← Pipeline orchestrator (CLI)
-├── app.py                      ← Streamlit dashboard
+├── config/
+│   └── simulation_params.yaml     # Business parameters (hazard threshold, costs, etc.)
+├── data/
+│   ├── raw/                       # Raw datasets (gitignored — download separately)
+│   └── processed/                 # Feature cache (gitignored — auto-generated)
 ├── src/
-│   ├── data_loader.py          ← Data ingestion & strict cleaning
-│   ├── feature_engine.py       ← RFM + Survival feature engineering
-│   ├── models.py               ← WeibullAFT, CoxPH, Logistic, RFM
-│   ├── policy.py               ← EVI-based intervention policy engine
-│   ├── evaluation.py           ← C-index, IBS, AUC, business metrics
-│   └── visualization.py        ← Publication-quality figures
-└── outputs/
-    ├── figures/                ← Generated PNG plots
-    ├── reports/                ← intervention_decisions.csv
-    └── models/                 ← Serialized model artifacts (auto-generated)
+│   ├── data_loader.py             # UCI Online Retail loader
+│   ├── data_loader_tafeng.py      # Ta Feng Grocery loader
+│   ├── data_loader_cdnow.py       # CDNOW loader
+│   ├── feature_engine.py          # Vectorized RFM + survival features
+│   ├── models.py                  # Weibull AFT, CoxPH, Logistic, RFM
+│   ├── policy.py                  # EVI Decision Engine
+│   ├── simulator.py               # Monte Carlo Simulation
+│   ├── evaluation.py              # C-index, IBS, AUC, business metrics
+│   ├── uplift.py                  # Uplift Modeling (T-Learner)
+│   ├── comparison.py              # Cross-run comparison report
+│   └── visualization.py           # Publication-ready plots
+├── tests/
+│   └── test_components.py         # Unit tests for core modules
+├── outputs/                       # All pipeline outputs (gitignored)
+│   └── {DATASET}_tau{N}/          # Isolated per-run output directory
+│       ├── figures/               # Generated plots
+│       ├── reports/               # intervention_decisions.csv
+│       ├── models/                # Serialized .pkl artifacts
+│       └── logs/                  # Timestamped pipeline logs
+├── notebooks/                     # Jupyter exploration (gitignored)
+├── app.py                         # Streamlit Dashboard
+├── main.py                        # Pipeline Orchestrator
+├── Dockerfile                     # Container definition
+├── docker-compose.yml             # Dashboard + MLflow services
+├── requirements.txt               # Production dependencies
+├── requirements-dev.txt           # Dev/notebook dependencies
+└── README.md
 ```
 
 ---
 
-## Pipeline CLI Options
+## ⚙️ Configuration
+Adjust business parameters in `config/simulation_params.yaml`:
 
+```yaml
+policy:
+  hazard_threshold: 0.01    # Daily hazard trigger
+  cost_per_contact: 1.0     # Cost per intervention (£)
+  response_rate: 0.15       # Expected campaign success rate
+```
+
+---
+
+## 📊 Key Results
+
+### UCI Online Retail (n=4,338)
+| Metric | Score | Target |
+|---|---|---|
+| **Weibull C-index (OOS)** | **0.829** | > 0.60 ✅ |
+| **IBS Score** | **0.162** | < 0.25 ✅ |
+
+### CDNOW (n=23,502)
+| Metric | Score | Target |
+|---|---|---|
+| **Weibull C-index (OOS)** | **0.773** | > 0.60 ✅ |
+| **IBS Score** | **0.077** | < 0.25 ✅ |
+| **CV Mean C-index** | **0.746** | > 0.60 ✅ |
+
+> **Monte Carlo Simulation**: The Weibull policy achieves significantly higher revenue precision per contact compared to standard RFM targeting, while reducing outreach costs by ~77%.
+
+---
+
+## 🐳 Docker Deployment
+
+**Run everything (Dashboard + MLflow):**
 ```bash
-python main.py                    # Full run (includes SHAP, ~5 min)
-python main.py --no-shap          # Fast run (skip SHAP)
-python main.py --tau 60           # Change churn threshold to 60 days
-python main.py --tau 120          # Change churn threshold to 120 days
-python main.py --sensitivity      # Test tau in {60, 90, 120} days
+docker compose up --build
 ```
+- Dashboard: http://localhost:8501
+- MLflow UI: http://localhost:5000
 
 ---
 
-## Key Results (tau = 90 days, 4,338 customers)
-
-| Metric | Value | Target |
-|---|---|---|
-| Weibull AFT C-index | **0.9815** | > 0.60 ✅ |
-| CoxPH C-index | **0.9842** | > 0.58 ✅ |
-| Logistic AUC (no leakage) | **0.7766** | > 0.65 ✅ |
-| Integrated Brier Score | **0.0808** | < 0.25 ✅ |
-| Time-AUC at 30 days | **0.893** | — |
-| Outreach efficiency gain | **69.3%** | ≥ 20% ✅ |
-| Weibull shape param ρ | **1.4524** | ρ > 1 (increasing hazard) ✅ |
-
----
-
-## Methodology
-
-### Framework
-Shifts from binary churn classification to a **decision-centric survival analysis** framework:
-
-```
-Traditional:  P(churn | x)          → "Who will churn?"
-This project: T(x) ~ Weibull AFT    → "When to intervene?"
-```
-
-### Feature Engineering
-| Feature | Description |
-|---|---|
-| Recency | Days since last purchase |
-| Frequency | Total number of orders |
-| Monetary | Total spend (GBP) |
-| InterPurchaseTime | Average days between orders |
-| GapStability | Std dev of inter-purchase gaps |
-| SinglePurchase | Binary flag (1 = only one order ever) |
-
-### Survival Target
-- **T** = Days from first to last purchase (or observation end)
-- **E** = 1 if inactive > tau days (churned), 0 if censored (still active)
-
-### Policy Engine
-```
-EVI(t*, i) = p_response × Monetary_i × [1 - S(t* | x_i)] - C_contact
-
-Decision:
-  IF S(t) < 0.05              → LOST      (intervention not viable)
-  IF h(t) > θ_h AND EVI > 0  → INTERVENE (send re-engagement email)
-  ELSE                        → WAIT      (monitor next cycle)
-```
-
-### Models
-| Model | Role | Library |
-|---|---|---|
-| **Weibull AFT** | Primary — continuous survival time | `lifelines` |
-| **CoxPH** | Semi-parametric baseline | `lifelines` |
-| **Logistic Regression** | Binary classification baseline (Recency excluded) | `scikit-learn` |
-| **RFM Quintiles** | Heuristic baseline | custom |
-
----
-
-## Dashboard Features
-
-The Streamlit dashboard (`app.py`) provides:
-- **Customer lookup** by ID with real-time risk computation
-- **INTERVENE 🔴 / WAIT 🟢 / LOST ⚫** recommendation with EVI in GBP
-- **Individual survival S(t) and hazard h(t) curves** with current-recency marker
-- **Adjustable policy parameters** (hazard threshold, response rate, contact cost)
-- **Portfolio overview** — segment distribution and decision breakdown
-
----
-
-## Dependencies
-
-```
-pandas >= 1.5.0
-numpy >= 1.23.0
-openpyxl >= 3.0.10
-scikit-learn >= 1.2.0
-lifelines >= 0.27.0
-matplotlib >= 3.6.0
-seaborn >= 0.12.0
-scipy >= 1.10.0
-shap >= 0.41.0
-streamlit >= 1.20.0
-joblib >= 1.2.0
-```
-
----
-
-## Citation
-
-Dataset: Daqing Chen, Sai Liang Sain, and Kun Guo, *Data mining for the online retail industry: A case study of RFM model-based customer segmentation using data mining*, Journal of Database Marketing and Customer Strategy Management, 2012.
-
----
-
-*Project presented at the International Council — Seoul, 2026.*
+## 📝 Citation
+*D. Chen et al., "Data mining for the online retail industry: A case study of RFM model-based customer segmentation", 2012.*

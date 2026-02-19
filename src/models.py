@@ -4,9 +4,15 @@ src/models.py
 Implements and trains all four models in the Decision-Centric framework:
 
   1. WeibullAFTFitter  (lifelines) -- Primary survival model
+     * Grid search penalizer via k-fold cross-validation (PHASE 4)
   2. CoxPHFitter       (lifelines) -- Semi-parametric baseline
   3. LogisticRegression (sklearn)  -- Binary classification baseline
   4. RFM Segmentation  (custom)    -- Heuristic quintile-based baseline
+
+Scientific safeguards (PHASE 4 additions):
+  _check_vif()     : VIF > 5 -> drop the worst collinear feature (non-destructive).
+  train_weibull_aft: Grid search over penalizer in [0.0, 0.01, 0.1, 1.0] using
+                     lifelines 3-fold k_fold_cross_validation; selects by C-index.
 
 Mathematical background:
   Weibull AFT: log(T) = beta'x + sigma*epsilon,  epsilon ~ Gumbel(0,1)
@@ -31,20 +37,26 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from lifelines import WeibullAFTFitter, CoxPHFitter
+from lifelines.utils import k_fold_cross_validation
+try:
+    from statsmodels.stats.outliers_influence import variance_inflation_factor as _vif_func
+    _STATSMODELS_AVAILABLE = True
+except ImportError:
+    _STATSMODELS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 # Feature columns used by survival models (Weibull AFT, CoxPH)
 SURVIVAL_FEATURES = [
     "Recency", "Frequency", "Monetary",
-    "InterPurchaseTime", "GapStability", "SinglePurchase",
+    "InterPurchaseTime", "GapDeviation", "SinglePurchase",
 ]
 
 # Feature columns for Logistic Regression (Recency EXCLUDED to prevent leakage)
 # E = (Recency > tau) => including Recency gives AUC = 1.0 trivially
 LOGISTIC_FEATURES = [
     "Frequency", "Monetary",
-    "InterPurchaseTime", "GapStability", "SinglePurchase",
+    "InterPurchaseTime", "GapDeviation", "SinglePurchase",
 ]
 
 
@@ -57,41 +69,211 @@ def _get_preprocessor() -> Pipeline:
 
 
 # =============================================================================
-# 1. Weibull AFT Model
+# VIF Multicollinearity Guard (Phase 4)
 # =============================================================================
+
+def _check_vif(
+    df_scaled: pd.DataFrame,
+    feature_cols: list,
+    vif_threshold: float = 5.0,
+) -> list:
+    """
+    Recursively compute Variance Inflation Factor (VIF) and drop features
+    until all remaining VIFs are <= *vif_threshold*.
+
+    Rationale
+    ---------
+    VIF > 5 signals severe multicollinearity, which inflates coefficient
+    variance, causes numerical instability in the Weibull log-likelihood, and
+    leads to misleadingly high concordance on in-sample predictions.
+
+    Strategy: recursive drop-one.  Each iteration drops only the single worst
+    offender, then recomputes VIF on the remaining features.  This is more
+    conservative than dropping all violators at once, keeps changes auditable,
+    and avoids over-pruning induced by masking effects.
+    The global SURVIVAL_FEATURES list is *never* mutated — the pruned list is
+    returned and used for this run only.
+
+    Parameters
+    ----------
+    df_scaled : pd.DataFrame
+        Pre-scaled feature matrix (columns = feature_cols).
+    feature_cols : list of str
+        Features to evaluate. Must all be columns in df_scaled.
+    vif_threshold : float
+        VIF cutoff above which a feature is flagged (default: 5.0).
+
+    Returns
+    -------
+    list of str
+        Pruned feature list (same as input if no VIF violation found).
+    """
+    if not _STATSMODELS_AVAILABLE:
+        logger.warning(
+            "[VIF] statsmodels not installed — skipping multicollinearity check. "
+            "Install with: pip install statsmodels"
+        )
+        return list(feature_cols)
+
+    cols = list(feature_cols)
+    iteration = 0
+
+    while True:
+        if len(cols) < 2:
+            logger.info("[VIF] Only one feature remaining — stopping VIF loop.")
+            break
+
+        X = df_scaled[cols].values.astype(float)
+
+        # Compute VIF for all current features
+        vif_scores = {}
+        for i, col in enumerate(cols):
+            try:
+                score = _vif_func(X, i)
+            except Exception:
+                score = np.nan
+            vif_scores[col] = score
+
+        logger.info(f"[VIF] Iteration {iteration} — Variance Inflation Factors:")
+        for col, score in vif_scores.items():
+            flag = " <-- HIGH" if (not np.isnan(score) and score > vif_threshold) else ""
+            logger.info(f"  {col:25s}: {score:8.3f}{flag}")
+
+        # Find the worst offender among valid (non-NaN) scores
+        valid_scores = {k: v for k, v in vif_scores.items() if not np.isnan(v)}
+        if not valid_scores:
+            logger.info("[VIF] All VIF scores are NaN — stopping loop.")
+            break
+
+        max_col = max(valid_scores, key=lambda k: valid_scores[k])
+        max_vif  = valid_scores[max_col]
+
+        if max_vif <= vif_threshold:
+            logger.info(
+                f"[VIF] All VIFs <= {vif_threshold} (max={max_vif:.2f} for '{max_col}'). "
+                f"Final feature set ({len(cols)}): {cols}"
+            )
+            break
+
+        # Drop the worst offender and loop again
+        logger.warning(
+            f"[VIF] Iteration {iteration}: '{max_col}' has VIF={max_vif:.2f} "
+            f"(threshold={vif_threshold}). Dropping and re-checking."
+        )
+        cols.remove(max_col)
+        logger.warning(f"[VIF] Remaining features ({len(cols)}): {cols}")
+        iteration += 1
+
+    return cols
+
+
+# =============================================================================
+# 1. Weibull AFT Model  (Phase 4: VIF guard + penalizer grid search)
+# =============================================================================
+
+# Default penalizer candidates for cross-validated grid search
+_WEIBULL_PENALIZER_GRID = [0.0, 0.01, 0.1, 1.0]
+_WEIBULL_CV_FOLDS       = 3
+
 
 def train_weibull_aft(
     customer_df: pd.DataFrame,
     penalizer: float = 0.01,
+    penalizer_grid: list = None,
 ) -> tuple:
     """
-    Fit a Weibull Accelerated Failure Time model.
+    Fit a Weibull Accelerated Failure Time model with scientific safeguards.
+
+    Phase 4 additions
+    -----------------
+    1. VIF check  : Before training, computes VIF for all SURVIVAL_FEATURES.
+                    If any feature has VIF > 5.0, the single worst offender is
+                    dropped for this run (SURVIVAL_FEATURES is not mutated).
+
+    2. Grid search: Iterates over *penalizer_grid* (default [0.0, 0.01, 0.1, 1.0])
+                    using lifelines 3-fold k_fold_cross_validation. Selects the
+                    penalizer with the highest mean concordance and retrains the
+                    final model on the full dataset.
 
     Parameters
     ----------
     customer_df : pd.DataFrame
         Customer-level DataFrame with features + T + E columns.
     penalizer : float
-        L2 regularization strength (default: 0.01).
+        Fallback penalizer used if grid search fails (default: 0.01).
+    penalizer_grid : list of float, optional
+        Candidate penalizer values. Defaults to [0.0, 0.01, 0.1, 1.0].
 
     Returns
     -------
     waf : WeibullAFTFitter
-        Fitted Weibull AFT model.
+        Fitted Weibull AFT model (retrained on full data with optimal penalizer).
     df_scaled : pd.DataFrame
         Scaled feature DataFrame used for fitting (preserves T, E).
     preprocessor : Pipeline
         Fitted sklearn preprocessing pipeline.
     """
-    logger.info("Training Weibull AFT model...")
+    logger.info("Training Weibull AFT model (Phase 4: VIF + grid search)...")
 
+    if penalizer_grid is None:
+        penalizer_grid = _WEIBULL_PENALIZER_GRID
+
+    # ── Scale features ───────────────────────────────────────────────────────
     preprocessor = _get_preprocessor()
     X_scaled = preprocessor.fit_transform(customer_df[SURVIVAL_FEATURES])
-    df_scaled = pd.DataFrame(X_scaled, columns=SURVIVAL_FEATURES, index=customer_df.index)
-    df_scaled["T"] = customer_df["T"].values
-    df_scaled["E"] = customer_df["E"].values
+    df_scaled_full = pd.DataFrame(
+        X_scaled, columns=SURVIVAL_FEATURES, index=customer_df.index
+    )
+    df_scaled_full["T"] = customer_df["T"].values
+    df_scaled_full["E"] = customer_df["E"].values
 
-    waf = WeibullAFTFitter(penalizer=penalizer)
+    # ── Phase 4 Task 2: VIF multicollinearity check ───────────────────────────
+    active_features = _check_vif(df_scaled_full, SURVIVAL_FEATURES)
+
+    # Rebuild df_scaled with only active features + T, E (drop pruned cols)
+    df_scaled = df_scaled_full[active_features + ["T", "E"]].copy()
+
+    # ── Phase 4 Task 3: Grid search via k-fold cross-validation ──────────────
+    logger.info(
+        f"[GridSearch] Testing penalizers {penalizer_grid} "
+        f"with {_WEIBULL_CV_FOLDS}-fold CV..."
+    )
+
+    best_penalizer  = penalizer  # fallback
+    best_cv_score   = -np.inf
+    grid_results    = {}
+
+    for p in penalizer_grid:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                scores = k_fold_cross_validation(
+                    WeibullAFTFitter(penalizer=p),
+                    df_scaled,
+                    duration_col="T",
+                    event_col="E",
+                    k=_WEIBULL_CV_FOLDS,
+                    scoring_method="concordance_index",
+                )
+            mean_score = np.mean(scores)
+            grid_results[p] = mean_score
+            logger.info(f"  penalizer={p:<6} -> CV C-index: {mean_score:.4f}")
+
+            if mean_score > best_cv_score:
+                best_cv_score  = mean_score
+                best_penalizer = p
+
+        except Exception as exc:
+            logger.warning(f"  penalizer={p} -> CV failed: {exc}")
+            grid_results[p] = np.nan
+
+    logger.info(
+        f"[GridSearch] *** Optimal penalizer: {best_penalizer} "
+        f"| CV C-index: {best_cv_score:.4f} ***"
+    )
+
+    # ── Final model: retrain on full dataset with optimal penalizer ───────────
+    waf = WeibullAFTFitter(penalizer=best_penalizer)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         waf.fit(df_scaled, duration_col="T", event_col="E")
@@ -99,7 +281,9 @@ def train_weibull_aft(
     rho_val = waf.params_["rho_"]["Intercept"]
     logger.info(f"Weibull AFT fitted | rho = {rho_val:.4f}")
     logger.info(f"  Shape param rho > 1 -> increasing hazard over time: {rho_val > 1}")
-    return waf, df_scaled, preprocessor
+    logger.info(f"  Active features ({len(active_features)}): {active_features}")
+
+    return waf, df_scaled, preprocessor, active_features
 
 
 # =============================================================================
@@ -109,44 +293,102 @@ def train_weibull_aft(
 def train_coxph(
     customer_df: pd.DataFrame,
     penalizer: float = 0.1,
+    penalizer_grid: list = None,
     check_assumptions: bool = True,
 ) -> tuple:
     """
-    Fit a Cox Proportional Hazards model.
+    Fit a Cox Proportional Hazards model with Phase 4/5 scientific safeguards.
+
+    Additions (mirroring Weibull AFT)
+    ----------------------------------
+    1. VIF check   : Drops the worst collinear feature if VIF > 5.0.
+    2. Grid search : Tests penalizer in [0.01, 0.1, 0.5, 1.0] via 3-fold
+                     k_fold_cross_validation; selects by concordance index.
 
     Parameters
     ----------
     customer_df : pd.DataFrame
         Customer-level DataFrame with features + T + E columns.
     penalizer : float
-        Ridge regularization (default: 0.1).
+        Fallback penalizer if grid search fails (default: 0.1).
+    penalizer_grid : list of float, optional
+        Candidate penalizers. Defaults to [0.01, 0.1, 0.5, 1.0].
+        (Higher values than Weibull grid -- CoxPH log-partial likelihood
+        benefits from stronger regularization when features are correlated.)
     check_assumptions : bool
         If True, run Schoenfeld residuals test for PH assumption.
 
     Returns
     -------
     cph : CoxPHFitter
-        Fitted CoxPH model.
+        Fitted CoxPH model (retrained on full data with optimal penalizer).
     df_scaled : pd.DataFrame
-        Scaled feature DataFrame used for fitting.
+        Scaled feature DataFrame (VIF-pruned if applicable) with T, E columns.
     preprocessor : Pipeline
         Fitted sklearn preprocessing pipeline.
+    active_features : list of str
+        Features used for training (may be shorter than SURVIVAL_FEATURES if
+        VIF pruned one).
     """
-    logger.info("Training Cox Proportional Hazards model...")
+    logger.info("Training Cox Proportional Hazards model (Phase 5: VIF + grid search)...")
 
+    if penalizer_grid is None:
+        penalizer_grid = [0.01, 0.1, 0.5, 1.0]
+
+    # ── Scale features ────────────────────────────────────────────────────────
     preprocessor = _get_preprocessor()
     X_scaled = preprocessor.fit_transform(customer_df[SURVIVAL_FEATURES])
-    df_scaled = pd.DataFrame(X_scaled, columns=SURVIVAL_FEATURES, index=customer_df.index)
-    df_scaled["T"] = customer_df["T"].values
-    df_scaled["E"] = customer_df["E"].values
+    df_scaled_full = pd.DataFrame(X_scaled, columns=SURVIVAL_FEATURES, index=customer_df.index)
+    df_scaled_full["T"] = customer_df["T"].values
+    df_scaled_full["E"] = customer_df["E"].values
 
-    cph = CoxPHFitter(penalizer=penalizer)
+    # ── VIF multicollinearity check ───────────────────────────────────────────
+    active_features = _check_vif(df_scaled_full, SURVIVAL_FEATURES)
+    df_scaled = df_scaled_full[active_features + ["T", "E"]].copy()
+
+    # ── Grid search via k-fold cross-validation ───────────────────────────────
+    logger.info(
+        f"[CoxPH GridSearch] Testing penalizers {penalizer_grid} "
+        f"with {_WEIBULL_CV_FOLDS}-fold CV..."
+    )
+
+    best_penalizer = penalizer
+    best_cv_score  = -np.inf
+
+    for p in penalizer_grid:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                scores = k_fold_cross_validation(
+                    CoxPHFitter(penalizer=p),
+                    df_scaled,
+                    duration_col="T",
+                    event_col="E",
+                    k=_WEIBULL_CV_FOLDS,
+                    scoring_method="concordance_index",
+                )
+            mean_score = np.mean(scores)
+            logger.info(f"  penalizer={p:<6} -> CV C-index: {mean_score:.4f}")
+            if mean_score > best_cv_score:
+                best_cv_score  = mean_score
+                best_penalizer = p
+        except Exception as exc:
+            logger.warning(f"  penalizer={p} -> CV failed: {exc}")
+
+    logger.info(
+        f"[CoxPH GridSearch] *** Optimal penalizer: {best_penalizer} "
+        f"| CV C-index: {best_cv_score:.4f} ***"
+    )
+
+    # ── Final model: retrain on full dataset with optimal penalizer ───────────
+    cph = CoxPHFitter(penalizer=best_penalizer)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         cph.fit(df_scaled, duration_col="T", event_col="E", show_progress=False)
 
     logger.info("CoxPH fitted.")
     logger.info(f"\n{cph.summary[['coef', 'exp(coef)', 'p']].to_string()}")
+    logger.info(f"  Active features ({len(active_features)}): {active_features}")
 
     if check_assumptions:
         logger.info("Running Schoenfeld residuals test (PH assumption check)...")
@@ -157,7 +399,7 @@ def train_coxph(
         except Exception as e:
             logger.warning(f"Assumption check raised: {e}")
 
-    return cph, df_scaled, preprocessor
+    return cph, df_scaled, preprocessor, active_features
 
 
 # =============================================================================

@@ -23,17 +23,37 @@ where:
 """
 
 import logging
+import os
 import numpy as np
 import pandas as pd
 from lifelines import WeibullAFTFitter
 
 logger = logging.getLogger(__name__)
 
-# ── Default Policy Thresholds ─────────────────────────────────────────────────
-DEFAULT_HAZARD_THRESHOLD   = 0.01   # h(t) per day — above this = high risk
-DEFAULT_SURVIVAL_FLOOR     = 0.05   # S(t) below this = customer is lost
-DEFAULT_RESPONSE_RATE      = 0.15   # 15% campaign response rate
-DEFAULT_COST_PER_CONTACT   = 1.0    # £1.00 per email/contact
+# ── Load policy defaults from config/simulation_params.yaml (if available) ────
+def _load_policy_config() -> dict:
+    """Load policy section from YAML config. Falls back to hard-coded defaults."""
+    _cfg_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "config", "simulation_params.yaml"
+    )
+    try:
+        import yaml  # pyyaml
+        with open(_cfg_path, "r") as f:
+            cfg = yaml.safe_load(f)
+        policy = cfg.get("policy", {})
+        logger.debug("[Policy] Loaded defaults from config/simulation_params.yaml")
+        return policy
+    except Exception:
+        return {}
+
+_policy_cfg = _load_policy_config()
+
+# ── Default Policy Thresholds (YAML overrides hard-coded fallbacks) ───────────
+DEFAULT_HAZARD_THRESHOLD = _policy_cfg.get("hazard_threshold",   0.01)
+DEFAULT_SURVIVAL_FLOOR   = _policy_cfg.get("survival_floor",     0.05)
+DEFAULT_RESPONSE_RATE    = _policy_cfg.get("response_rate",      0.15)
+DEFAULT_COST_PER_CONTACT = _policy_cfg.get("cost_per_contact",   1.0)
 
 
 def _compute_hazard_from_survival(
@@ -223,8 +243,9 @@ def make_intervention_decisions(
     )
 
     return signals[
-        ["CustomerID", "hazard_now", "survival_now", "evi", "decision", "optimal_window_days"]
-    ]
+        ["CustomerID", "hazard_now", "survival_now", "evi", "decision",
+         "optimal_window_days", "Monetary"]
+    ].rename(columns={"survival_now": "survival"})
 
 
 def rfm_intervention_decisions(rfm_df: pd.DataFrame) -> pd.DataFrame:

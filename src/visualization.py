@@ -174,6 +174,7 @@ def plot_shap_summary(
     n_background: int = 100,
     n_explain: int = 300,
     save_path: str = None,
+    save_csv_path: str = None,
 ) -> None:
     """
     Generate SHAP summary plot for the Weibull AFT model.
@@ -202,6 +203,17 @@ def plot_shap_summary(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         shap_values = explainer.shap_values(X_explain, nsamples=100)
+
+    # Save feature importance to CSV
+    if save_csv_path:
+        # Mean absolute SHAP value per feature
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        shap_df = pd.DataFrame({
+            "Feature": feature_cols,
+            "Mean_Abs_SHAP": mean_abs_shap
+        }).sort_values("Mean_Abs_SHAP", ascending=False)
+        shap_df.to_csv(save_csv_path, index=False)
+        logger.info(f"Saved SHAP importance table → {save_csv_path}")
 
     fig, ax = plt.subplots(figsize=(10, 6))
     shap.summary_plot(

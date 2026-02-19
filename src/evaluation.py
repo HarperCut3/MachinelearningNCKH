@@ -186,6 +186,88 @@ def compute_time_dependent_auc(
     return auc_df
 
 
+def cross_validate_survival_model(
+    model_class,
+    df,
+    duration_col="T",
+    event_col="E",
+    n_splits=5,
+    random_state=42,
+    model_kwargs=None
+) -> dict:
+    """
+    Perform Stratified K-Fold Cross-Validation for a lifelines survival model.
+
+    Parameters
+    ----------
+    model_class : class
+        The lifelines model class (e.g. WeibullAFTFitter).
+    df : pd.DataFrame
+        Dataframe containing features, duration_col, and event_col.
+    duration_col : str
+        Name of duration column (default "T").
+    event_col : str
+        Name of event column (default "E").
+    n_splits : int
+        Number of folds (default 5).
+    random_state : int
+        Seed for reproducibility.
+    model_kwargs : dict
+        Arguments to pass to model constructor (e.g. penalizer).
+
+    Returns
+    -------
+    dict
+        {
+            "mean_c_index": float,
+            "std_c_index": float,
+            "folds": list[float]
+        }
+    """
+    if model_kwargs is None:
+        model_kwargs = {}
+    
+    # Lazy import to avoid circular dependency if any (though sklearn is safe)
+    from sklearn.model_selection import StratifiedKFold
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    c_indices = []
+    
+    logger.info(f"Starting {n_splits}-Fold CV for {model_class.__name__}...")
+
+    # Stratify by Event (E) to ensure balanced censorship in train/test
+    for fold, (train_idx, test_idx) in enumerate(skf.split(df, df[event_col])):
+        df_train = df.iloc[train_idx]
+        df_test  = df.iloc[test_idx]
+        
+        try:
+            model = model_class(**model_kwargs)
+            model.fit(df_train, duration_col=duration_col, event_col=event_col)
+            
+            # Evaluate on test fold
+            # score() defaults to concordance_index for survival fitters
+            c = model.score(df_test, scoring_method="concordance_index")
+            c_indices.append(c)
+            # logger.debug(f"  [Fold {fold+1}] C-index: {c:.4f}")
+            
+        except Exception as e:
+            logger.warning(f"  [Fold {fold+1}] Failed: {e}")
+            
+    if not c_indices:
+        return {"mean_c_index": 0.0, "std_c_index": 0.0, "folds": []}
+
+    mean_c = np.mean(c_indices)
+    std_c  = np.std(c_indices)
+    
+    logger.info(f"CV Results ({model_class.__name__}): Mean C-index = {mean_c:.4f} (+/- {std_c:.4f})")
+    
+    return {
+        "mean_c_index": mean_c,
+        "std_c_index":  std_c,
+        "folds":        c_indices
+    }
+
+
 # =============================================================================
 # Business / Decision Metrics
 # =============================================================================

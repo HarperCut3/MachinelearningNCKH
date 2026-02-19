@@ -11,17 +11,30 @@ Features produced:
     - Monetary         : Total spend (GBP)
 
   Temporal (Dynamic):
-    - InterPurchaseTime: Mean inter-purchase gap (days)
-    - GapStability     : Std dev of inter-purchase gaps (days)
+    - InterPurchaseTime: Mean inter-purchase gap (days); 0.0 for single-visit
+    - GapDeviation     : Std dev of inter-purchase gaps (days); 0.0 if < 2 gaps
     - SinglePurchase   : Binary flag — customer made only 1 purchase
 
   Survival Target:
-    - T                : Observation window (days from first to last purchase)
-    - E                : Event indicator (1 = churned, 0 = censored)
+    - T  : Observation window in days.
+           Repeat purchasers : days from first to last purchase (active span).
+           Single purchasers : Recency (days from only purchase to snapshot).
+           Rationale: T must represent how long the customer has been *observed*,
+           not just their inter-purchase span.  Using T=clip(1) for single-buyers
+           creates an artificial spike at T=1 that biases rho < 1.
+    - E  : Event indicator (1 = churned, 0 = censored)
 
 Churn Definition:
     E_i = 1  if  Recency_i > tau  (customer has been inactive > tau days)
     E_i = 0  if  Recency_i <= tau (customer is still considered active)
+
+Performance Note (Phase 7):
+    InterPurchaseTime and GapDeviation are computed with fully vectorized
+    pandas operations — no .apply() on groups.  The approach:
+      1. Sort df by [CustomerID, InvoiceDate] once.
+      2. Compute per-row date diff via groupby(...).diff().dt.days.
+      3. Aggregate [mean, std] with a single groupby().agg() call.
+    This is O(N log N) vs the previous O(N * k) .apply() loop.
 """
 
 import logging
@@ -52,7 +65,7 @@ def build_customer_features(
     -------
     pd.DataFrame
         Customer-level DataFrame indexed by CustomerID with columns:
-        [Recency, Frequency, Monetary, InterPurchaseTime, GapStability,
+        [Recency, Frequency, Monetary, InterPurchaseTime, GapDeviation,
          SinglePurchase, T, E]
     """
     logger.info(f"Building customer features | snapshot={snapshot.date()} | tau={tau} days")
@@ -61,36 +74,57 @@ def build_customer_features(
     grp = df.groupby("CustomerID")
 
     # ── RFM Features ─────────────────────────────────────────────────────────
-    recency    = (snapshot - grp["InvoiceDate"].max()).dt.days.rename("Recency")
-    frequency  = grp["InvoiceNo"].nunique().rename("Frequency")
-    monetary   = grp["TotalSpend"].sum().rename("Monetary")
+    recency   = (snapshot - grp["InvoiceDate"].max()).dt.days.rename("Recency")
+    frequency = grp["InvoiceNo"].nunique().rename("Frequency")
+    monetary  = grp["TotalSpend"].sum().rename("Monetary")
 
-    # ── Temporal Features ─────────────────────────────────────────────────────
-    def _inter_purchase_stats(dates: pd.Series):
-        """Compute mean and std of inter-purchase gaps for a customer."""
-        sorted_dates = dates.sort_values().drop_duplicates()
-        if len(sorted_dates) < 2:
-            return pd.Series({"InterPurchaseTime": np.nan, "GapStability": 0.0})
-        gaps = sorted_dates.diff().dropna().dt.days
-        return pd.Series({
-            "InterPurchaseTime": gaps.mean(),
-            "GapStability":      gaps.std(ddof=1) if len(gaps) > 1 else 0.0,
-        })
+    # ── Temporal Features: Vectorized (Phase 7 performance fix) ──────────────
+    # Step 1: Sort the full DataFrame once by CustomerID + InvoiceDate.
+    #         We only need unique (CustomerID, InvoiceDate) pairs — multiple
+    #         invoices on the same day produce a gap of 0 which is uninformative
+    #         and inflates means. Drop duplicates for gap calculation.
+    df_sorted = (
+        df[["CustomerID", "InvoiceDate"]]
+        .drop_duplicates()
+        .sort_values(["CustomerID", "InvoiceDate"])
+    )
 
-    temporal_stats = grp["InvoiceDate"].apply(_inter_purchase_stats).unstack()
+    # Step 2: Compute per-row gap in days via groupby diff.
+    #         diff() is NaN for the *first* date of each customer — that is
+    #         correct; the first visit has no preceding gap.
+    df_sorted["gap_days"] = (
+        df_sorted.groupby("CustomerID")["InvoiceDate"]
+        .diff()
+        .dt.days
+    )
+
+    # Step 3: Aggregate mean and std of gaps in one pass.
+    #         ddof=1 (sample std) matches the previous implementation.
+    #         Customers with only one unique date → all gaps are NaN → mean/std
+    #         are NaN, which we impute below.
+    gap_agg = (
+        df_sorted.groupby("CustomerID")["gap_days"]
+        .agg(
+            InterPurchaseTime=("mean"),
+            GapDeviation=("std"),
+        )
+    )
 
     # ── SinglePurchase Flag ───────────────────────────────────────────────────
     single_purchase = (frequency == 1).astype(int).rename("SinglePurchase")
 
     # ── Survival Target: T (observation window) ───────────────────────────────
-    # T = days from first purchase to last purchase
-    # For single-purchase customers: T = 0 (they have no repeat history)
+    # Repeat purchasers  : T = days from first to last purchase (active span)
+    # Single purchasers  : T = Recency (days from only purchase to snapshot)
+    # Rationale: T.clip(1) for single-buyers creates a spike at T=1 that
+    #   biases rho < 1, inverting the Weibull hazard direction.
     first_purchase = grp["InvoiceDate"].min()
     last_purchase  = grp["InvoiceDate"].max()
-    T = (last_purchase - first_purchase).dt.days.rename("T")
 
-    # Ensure T >= 1 to avoid zero-duration issues in survival models
-    T = T.clip(lower=1)
+    T_repeat = (last_purchase - first_purchase).dt.days  # 0 for single buyers
+    T_single = recency                                    # observation window
+    T = T_repeat.where(single_purchase == 0, other=T_single).rename("T")
+    T = T.clip(lower=1)  # safety floor; T=0 causes log(0) in Weibull
 
     # ── Survival Target: E (event indicator) ─────────────────────────────────
     # E = 1 if customer has been inactive for more than tau days (churned)
@@ -99,23 +133,29 @@ def build_customer_features(
 
     # ── Assemble customer DataFrame ───────────────────────────────────────────
     customer_df = pd.concat(
-        [recency, frequency, monetary, temporal_stats, single_purchase, T, E],
-        axis=1
+        [recency, frequency, monetary, gap_agg, single_purchase, T, E],
+        axis=1,
     )
 
-    # ── Impute InterPurchaseTime for single-purchase customers ────────────────
-    # Use median of multi-purchase customers as a conservative estimate
-    median_ipt = customer_df.loc[
-        customer_df["SinglePurchase"] == 0, "InterPurchaseTime"
-    ].median()
-    customer_df["InterPurchaseTime"] = customer_df["InterPurchaseTime"].fillna(median_ipt)
-    customer_df["GapStability"]      = customer_df["GapStability"].fillna(0.0)
+    # ── Anti-Leakage Imputation ───────────────────────────────────────────────
+    # Impute InterPurchaseTime and GapDeviation with 0.0 for single-purchase
+    # customers (NOT cross-customer median — that is leakage).
+    # Zero is semantically correct: single-buyers have no inter-purchase gaps.
+    # The SinglePurchase=1 flag lets the model learn a separate effect.
+    n_single = int(customer_df["InterPurchaseTime"].isna().sum())
+    customer_df["InterPurchaseTime"] = customer_df["InterPurchaseTime"].fillna(0.0)
+    customer_df["GapDeviation"]      = customer_df["GapDeviation"].fillna(0.0)
+    if n_single > 0:
+        logger.info(
+            f"Imputed InterPurchaseTime=0.0 and GapDeviation=0.0 for "
+            f"{n_single:,} single-purchase customers (anti-leakage guard)."
+        )
 
     # ── Log summary statistics ────────────────────────────────────────────────
-    n_customers  = len(customer_df)
-    n_churned    = customer_df["E"].sum()
-    n_censored   = n_customers - n_churned
-    churn_rate   = n_churned / n_customers * 100
+    n_customers = len(customer_df)
+    n_churned   = customer_df["E"].sum()
+    n_censored  = n_customers - n_churned
+    churn_rate  = n_churned / n_customers * 100
 
     logger.info(
         f"Customer features built: {n_customers:,} customers | "
@@ -125,7 +165,8 @@ def build_customer_features(
     logger.info(
         f"T stats — mean: {customer_df['T'].mean():.1f}d | "
         f"median: {customer_df['T'].median():.1f}d | "
-        f"max: {customer_df['T'].max():.1f}d"
+        f"max: {customer_df['T'].max():.1f}d | "
+        f"single-purchase (T=Recency): {n_single:,} customers"
     )
 
     return customer_df
@@ -147,7 +188,11 @@ def sensitivity_analysis_tau(
     snapshot : pd.Timestamp
         Snapshot date.
     tau_values : list of int, optional
-        List of inactivity thresholds to test (default: [60, 90, 120]).
+        List of inactivity thresholds to test.
+        If None, computes adaptively from the dataset duration:
+        [duration//5, duration//3, duration//2].
+        Rationale: fixed values like {60, 90, 120} are meaningless for
+        a dataset shorter than 120 days (e.g. Ta Feng = 120d total).
 
     Returns
     -------
@@ -155,7 +200,16 @@ def sensitivity_analysis_tau(
         Mapping {tau: customer_df} for each threshold.
     """
     if tau_values is None:
-        tau_values = [60, 90, 120]
+        duration = (df["InvoiceDate"].max() - df["InvoiceDate"].min()).days
+        tau_values = sorted(set([
+            max(duration // 5, 1),
+            max(duration // 3, 1),
+            max(duration // 2, 1),
+        ]))
+        logger.info(
+            f"[SensitivityTau] Adaptive tau values (dataset duration={duration}d): "
+            f"{tau_values}"
+        )
 
     results = {}
     for tau in tau_values:

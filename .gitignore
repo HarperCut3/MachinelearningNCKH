@@ -9,11 +9,9 @@ dist/
 build/
 .eggs/
 
-# Data files (large — download separately)
-*.xlsx
-*.csv
-*.xls
-
+# Data files (large — download separately per README instructions)
+data/raw/
+data/processed/
 
 # Virtual environments
 venv/
@@ -25,15 +23,8 @@ env/
 .ipynb_checkpoints/
 *.ipynb
 
-# Dataset (large file — download separately from UCI)
-Online Retail.xlsx
-Online\ Retail.xlsx
-
 # Generated outputs (reproducible from pipeline)
-outputs/models/
-outputs/figures/
-outputs/reports/
-outputs/pipeline.log
+outputs/
 
 # IDE
 .vscode/
@@ -50,3 +41,12 @@ Thumbs.db
 
 # Antigravity / AI assistant
 .gemini/
+
+# MLflow experiment tracking
+mlruns/
+mlflow.db
+.mlflow/
+
+# Stale pipeline logs / outputs at root
+run_output*.txt
+comparison_report.csv

@@ -5,7 +5,7 @@ Pipeline Orchestrator -- Decision-Centric Customer Re-Engagement
 ================================================================
 Runs the full end-to-end pipeline:
 
-  1. Load & clean UCI Online Retail data
+  1. Load & clean data  (UCI Online Retail  OR  Ta Feng Grocery)
   2. Engineer customer-level RFM + Survival features
   3. Train Weibull AFT, CoxPH, Logistic Regression, RFM models
   4. Apply intervention policy (Weibull + RFM baseline)
@@ -15,9 +15,11 @@ Runs the full end-to-end pipeline:
   8. Export decision table to CSV
 
 Usage:
-  python main.py
-  python main.py --tau 60
-  python main.py --tau 120 --no-shap
+  python main.py                          # UCI dataset (default)
+  python main.py --dataset uci
+  python main.py --dataset tafeng
+  python main.py --dataset uci   --tau 60
+  python main.py --dataset tafeng --tau 120 --no-shap
   python main.py --sensitivity
 """
 
@@ -29,6 +31,7 @@ import warnings
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 
 # Suppress verbose third-party warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -36,13 +39,17 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # Project imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.data_loader    import load_and_clean, get_snapshot_date
+from src.data_loader         import load_and_clean, get_snapshot_date
+from src.data_loader_tafeng  import load_and_clean_tafeng, get_snapshot_date_tafeng
+from src.data_loader_cdnow   import load_data as load_cdnow
 from src.feature_engine import build_customer_features, sensitivity_analysis_tau
 from src.models         import (
     train_weibull_aft, train_coxph, train_logistic, rfm_segment,
     SURVIVAL_FEATURES,
 )
+from src.simulator       import run_monte_carlo_simulation
 from src.policy         import make_intervention_decisions, rfm_intervention_decisions
+from src.uplift         import run_uplift_analysis
 from src.evaluation     import (
     compute_c_index,
     compute_integrated_brier_score,
@@ -50,6 +57,7 @@ from src.evaluation     import (
     compute_outreach_efficiency,
     compute_revenue_lift,
     print_full_report,
+    cross_validate_survival_model,
 )
 from src.visualization  import (
     plot_kaplan_meier_by_segment,
@@ -61,23 +69,28 @@ from src.visualization  import (
 )
 
 # Configuration
-DATA_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Online Retail.xlsx")
-FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "figures")
-REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "reports")
-MODELS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "models")
-LOG_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "pipeline.log")
+DATA_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "raw", "Online Retail.xlsx")
+TAFENG_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "raw", "ta_feng_all_months_merged.csv")
+CDNOW_DATA_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "raw", "CDNOW_master.txt")
+
+# Timestamped log so every run preserves its own file
+import datetime as _dt
+_RUN_TS = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def setup_logging():
-    """Configure logging to both stdout and file."""
-    os.makedirs("outputs", exist_ok=True)
+    """Configure console-only logging. File handler added in main() after parse_args."""
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8"),
         ],
     )
 
@@ -98,6 +111,22 @@ def parse_args():
         "--sensitivity", action="store_true",
         help="Run sensitivity analysis across tau in {60, 90, 120}"
     )
+    parser.add_argument(
+        "--dataset", choices=["uci", "tafeng", "cdnow"], default="uci",
+        help="Which dataset to run the pipeline on: 'uci', 'tafeng', or 'cdnow'"
+    )
+    parser.add_argument(
+        "--uplift", action="store_true",
+        help="Run uplift modeling step (T-Learner + Qini curve)"
+    )
+    parser.add_argument(
+        "--no-mlflow", action="store_true",
+        help="Disable MLflow experiment tracking even if mlflow is installed"
+    )
+    parser.add_argument(
+        "--cv", action="store_true",
+        help="Run 5-fold cross-validation for survival models (slower)"
+    )
     return parser.parse_args()
 
 
@@ -109,19 +138,23 @@ def save_artifacts(
     weibull_decisions: pd.DataFrame,
     df_scaled_waf: pd.DataFrame,
     tau: int,
+    models_dir: str,
+    active_features_waf: list = None,
+    monte_carlo_results: dict = None,
+    metrics: dict = None,
 ) -> None:
     """
     Serialize trained models and processed data for the Streamlit dashboard.
 
-    Saves to outputs/models/:
-      - weibull_model.pkl       : Fitted WeibullAFTFitter
-      - preprocessor.pkl        : Fitted sklearn preprocessing pipeline
-      - processed_data.pkl      : Customer-level DataFrame (features + T, E, RFM)
-      - decisions.pkl           : Intervention decision table
-      - df_scaled.pkl           : Scaled feature DataFrame (for model input)
-      - pipeline_meta.pkl       : Metadata dict (tau, snapshot, feature names)
+    Saves to outputs/{DATASET}_tau{N}/models/:
+      - weibull_model.pkl
+      - preprocessor.pkl
+      - processed_data.pkl
+      - decisions.pkl
+      - df_scaled.pkl
+      - pipeline_meta.pkl
     """
-    os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
     logger = logging.getLogger("main")
 
     # Reset index so CustomerID becomes a column (it's the index in customer_df)
@@ -138,10 +171,13 @@ def save_artifacts(
         merged["evi"]      = merged["CustomerID"].map(evi_map)
 
     meta = {
-        "tau":               tau,
-        "survival_features": SURVIVAL_FEATURES,
-        "n_customers":       len(customer_df),
-        "churn_rate":        customer_df["E"].mean(),
+        "tau":                tau,
+        "survival_features":  SURVIVAL_FEATURES,
+        "active_features_waf": active_features_waf,
+        "n_customers":        len(customer_df),
+        "churn_rate":         customer_df["E"].mean(),
+        "monte_carlo_results": monte_carlo_results,
+        "metrics":            metrics,
     }
 
     artifacts = {
@@ -154,11 +190,11 @@ def save_artifacts(
     }
 
     for filename, obj in artifacts.items():
-        path = os.path.join(MODELS_DIR, filename)
+        path = os.path.join(models_dir, filename)
         joblib.dump(obj, path)
         logger.info(f"  Saved -> {path}")
 
-    logger.info(f"All artifacts saved to {MODELS_DIR}")
+    logger.info(f"All artifacts saved to {models_dir}")
 
 
 # =============================================================================
@@ -169,23 +205,99 @@ def main():
     logger = logging.getLogger("main")
     args = parse_args()
 
+    # ── Dynamic Output Paths (Phase 11) ───────────────────────────────────────
+    # Create isolated output directories for this specific dataset & tau configuration
+    RUN_DIR     = os.path.join("outputs", f"{args.dataset.upper()}_tau{args.tau}")
+    FIGURES_DIR = os.path.join(RUN_DIR, "figures")
+    REPORTS_DIR = os.path.join(RUN_DIR, "reports")
+    MODELS_DIR  = os.path.join(RUN_DIR, "models")
+    LOGS_DIR    = os.path.join(RUN_DIR, "logs")
+    CACHE_DIR   = os.path.join("data", "processed")
+
     os.makedirs(FIGURES_DIR, exist_ok=True)
     os.makedirs(REPORTS_DIR, exist_ok=True)
-    os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR,  exist_ok=True)
+    os.makedirs(LOGS_DIR,    exist_ok=True)
+    os.makedirs(CACHE_DIR,   exist_ok=True)
+
+    # Add run-specific file handler now that we know the output directory
+    LOG_PATH = os.path.join(LOGS_DIR, f"pipeline_{_RUN_TS}.log")
+    file_handler = logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.getLogger().addHandler(file_handler)
 
     logger.info("=" * 70)
     logger.info("  DECISION-CENTRIC CUSTOMER RE-ENGAGEMENT PIPELINE")
-    logger.info(f"  tau = {args.tau} days | SHAP = {not args.no_shap}")
+    logger.info(f"  Dataset = {args.dataset.upper()} | tau = {args.tau}d | SHAP = {not args.no_shap}")
+    logger.info(f"  Output Dir = {RUN_DIR}")
     logger.info("=" * 70)
 
-    # ── STEP 1: Load & Clean Data ─────────────────────────────────────────────
-    logger.info("\n[STEP 1] Loading and cleaning dataset...")
-    df_clean = load_and_clean(DATA_PATH)
-    snapshot = get_snapshot_date(df_clean)
+    # ── MLflow Experiment Tracking (optional) ─────────────────────────────────
+    _use_mlflow = False
+    try:
+        if not args.no_mlflow:
+            import mlflow
+            mlflow.set_experiment("customer_retention_survival")
+            mlflow.start_run(run_name=f"{args.dataset.upper()}_tau{args.tau}_{_RUN_TS}")
+            mlflow.log_params({
+                "dataset":   args.dataset,
+                "tau":       args.tau,
+                "shap":      not args.no_shap,
+                "uplift":    args.uplift,
+            })
+            _use_mlflow = True
+            logger.info("[MLflow] Experiment tracking started.")
+    except Exception as _mlf_exc:
+        pass # Silently fail if mlflow not installed or configured, handled by log below
+        logger.info(f"[MLflow] Tracking disabled: {_mlf_exc}")
 
-    # ── STEP 2: Feature Engineering ───────────────────────────────────────────
-    logger.info(f"\n[STEP 2] Engineering customer features (tau={args.tau}d)...")
-    customer_df = build_customer_features(df_clean, snapshot, tau=args.tau)
+    # ── STEP 1: Load & Clean Data ─────────────────────────────────────────────
+    logger.info(f"\n[STEP 1] Loading and cleaning dataset ({args.dataset.upper()})...")
+
+    if args.dataset == "tafeng":
+        df_clean = load_and_clean_tafeng(TAFENG_DATA_PATH)
+        snapshot = get_snapshot_date_tafeng(df_clean)
+    elif args.dataset == "cdnow":
+        df_clean = load_cdnow(CDNOW_DATA_PATH)
+        snapshot = df_clean["InvoiceDate"].max()
+    else:
+        # UCI Online Retail (default)
+        df_clean = load_and_clean(DATA_PATH)
+        snapshot = get_snapshot_date(df_clean)
+
+    # ── STEP 1b: Auto-Tau Sanity Check ────────────────────────────────────────
+    dataset_duration = (df_clean["InvoiceDate"].max() - df_clean["InvoiceDate"].min()).days
+    tau = args.tau
+
+    if tau > dataset_duration * 0.5:
+        corrected_tau = max(dataset_duration // 3, 1)
+        logger.warning("!" * 70)
+        logger.warning(f"  CRITICAL: tau ({tau}d) exceeds 50% of dataset duration ({dataset_duration}d).")
+        logger.warning(f"  AUTO-CORRECTING tau: {tau}d -> {corrected_tau}d")
+        logger.warning("!" * 70)
+        tau = corrected_tau
+    else:
+        logger.info(f"[AutoTau] tau={tau}d is safe (duration={dataset_duration}d).")
+
+    logger.info(f"  Effective tau = {tau} days")
+
+    # ── STEP 2: Feature Engineering (with Caching) ────────────────────────────
+    logger.info(f"\n[STEP 2] Engineering customer features (tau={tau}d)...")
+    
+    cache_path = os.path.join(CACHE_DIR, f"{args.dataset}_tau{tau}_features.parquet")
+    
+    if os.path.exists(cache_path):
+        logger.info(f"  [Cache Hit] Loading features from {cache_path}...")
+        customer_df = pd.read_parquet(cache_path)
+        logger.info(f"  Loaded {len(customer_df):,} customers from cache.")
+    else:
+        logger.info("  [Cache Miss] Computing features from scratch...")
+        customer_df = build_customer_features(df_clean, snapshot, tau=tau)
+        customer_df.to_parquet(cache_path)
+        logger.info(f"  Saved features to cache -> {cache_path}")
 
     if args.sensitivity:
         logger.info("\n[STEP 2b] Running sensitivity analysis across tau in {60, 90, 120}...")
@@ -194,16 +306,83 @@ def main():
             churn_rate = cdf["E"].mean() * 100
             logger.info(f"  tau={tau_val}d -> churn rate: {churn_rate:.1f}%")
 
+    # ── STEP 2c: Stratified 80/20 Customer-Level Holdout ──────────────────────
+    logger.info("\n[STEP 2c] Stratified 80/20 customer-level holdout split (stratify=E)...")
+    customer_df_train, customer_df_test = train_test_split(
+        customer_df,
+        test_size=0.2,
+        random_state=42,
+        stratify=customer_df["E"],
+    )
+    logger.info(
+        f"  Train: {len(customer_df_train):,} customers | "
+        f"churn rate: {customer_df_train['E'].mean()*100:.1f}%"
+    )
+    logger.info(
+        f"  Test : {len(customer_df_test):,} customers | "
+        f"churn rate: {customer_df_test['E'].mean()*100:.1f}%"
+    )
+
     # ── STEP 3: RFM Segmentation (Baseline) ──────────────────────────────────
     logger.info("\n[STEP 3] Computing RFM segmentation...")
     rfm_df = rfm_segment(customer_df)
 
-    # ── STEP 4: Train Models ──────────────────────────────────────────────────
-    logger.info("\n[STEP 4] Training survival models...")
+    # ── STEP 4: Train Models (on df_train only) ───────────────────────────────
+    # Models are fit exclusively on the 80% training set.
+    # Preprocessors (imputer + scaler) are fit on df_train and then applied
+    # (transform-only) to df_test to prevent any leakage across the split.
+    logger.info("\n[STEP 4] Training survival models on 80% train split...")
 
-    waf, df_scaled_waf, preprocessor_waf = train_weibull_aft(customer_df)
-    cph, df_scaled_cph, preprocessor_cph = train_coxph(customer_df)
-    lr, lr_pipeline, lr_cv_metrics       = train_logistic(customer_df)
+    waf, df_scaled_train_waf, preprocessor_waf, active_features_waf = train_weibull_aft(customer_df_train)
+    cph, df_scaled_train_cph, preprocessor_cph, active_features_cph = train_coxph(customer_df_train)
+    lr, lr_pipeline, lr_cv_metrics = train_logistic(customer_df_train)
+
+    # ── STEP 4b: Apply train-fitted preprocessors to remaining splits ──────────
+    #
+    # df_scaled_test_*   : OOS evaluation (20% held-out)
+    # df_scaled_waf      : All customers   (policy, dashboard, artifact saving)
+    #
+    # Only .transform() is called here — no fitting on test/all data.
+
+    def _apply_preprocessor(prep, source_df, active_feats):
+        """Transform source_df with a fitted preprocessor, keep only active features + T, E."""
+        X = prep.transform(source_df[SURVIVAL_FEATURES])
+        df_out = pd.DataFrame(X, columns=SURVIVAL_FEATURES, index=source_df.index)
+        df_out = df_out[active_feats].copy()
+        df_out["T"] = source_df["T"].values
+        df_out["E"] = source_df["E"].values
+        return df_out
+
+    # OOS (test) scaled frames
+    df_scaled_test_waf = _apply_preprocessor(preprocessor_waf, customer_df_test, active_features_waf)
+    df_scaled_test_cph = _apply_preprocessor(preprocessor_cph, customer_df_test, active_features_cph)
+
+    # All-customer scaled frame (for intervention policy + dashboard artifacts)
+    df_scaled_waf = _apply_preprocessor(preprocessor_waf, customer_df, active_features_waf)
+
+    # ── STEP 4a: Cross-Validation (optional) ──────────────────────────────────
+    cv_mean_c = None
+    cv_std_c  = None
+    if args.cv:
+        logger.info("\n[STEP 4a] Running 5-Fold Stratified Cross-Validation on WeibullAFT...")
+        # Use the training set active features + T, E
+        # Note: Ideally we would redo feature selection in each fold, but for
+        # stability estimation of the final featured set, this is acceptable.
+        try:
+            from lifelines import WeibullAFTFitter
+            cv_results = cross_validate_survival_model(
+                WeibullAFTFitter,
+                df_scaled_train_waf,
+                duration_col="T", event_col="E",
+                n_splits=5,
+                random_state=42,
+                model_kwargs={"penalizer": 0.01} # Match train_weibull_aft default
+            )
+            cv_mean_c = cv_results["mean_c_index"]
+            cv_std_c  = cv_results["std_c_index"]
+            # Log results handled inside function, but we can access them here if needed
+        except Exception as e:
+             logger.warning(f"CV process failed: {e}")
 
     # ── STEP 5: Intervention Policy ───────────────────────────────────────────
     logger.info("\n[STEP 5] Applying intervention policy...")
@@ -218,13 +397,61 @@ def main():
     weibull_decisions.to_csv(decision_path, index=False)
     logger.info(f"Decision table saved -> {decision_path}")
 
-    # ── STEP 6: Evaluation ────────────────────────────────────────────────────
+    # ── STEP 5b: Monte Carlo Policy Simulation ────────────────────────────────
+    logger.info("\n[STEP 5b] Running Monte Carlo Policy Simulation (n=1,000)...")
+    monte_carlo_results = {}
+    try:
+        monte_carlo_results = run_monte_carlo_simulation(
+            df_decisions=weibull_decisions,
+            n_iterations=1000,
+        )
+        w_ci  = monte_carlo_results.get("weibull_profit_ci",  (0, 0, 0))
+        r_ci  = monte_carlo_results.get("rfm_profit_ci",      (0, 0, 0))
+        eg_ci = monte_carlo_results.get("efficiency_gain_ci", (0, 0, 0))
+        logger.info(
+            f"  Weibull Policy  Profit  95% CI: "
+            f"[£{w_ci[0]:,.0f}, £{w_ci[1]:,.0f}, £{w_ci[2]:,.0f}]"
+        )
+        logger.info(
+            f"  RFM Baseline    Profit  95% CI: "
+            f"[£{r_ci[0]:,.0f}, £{r_ci[1]:,.0f}, £{r_ci[2]:,.0f}]"
+        )
+        logger.info(
+            f"  Efficiency Gain         95% CI: "
+            f"[{eg_ci[0]:+.1%}, {eg_ci[1]:+.1%}, {eg_ci[2]:+.1%}]"
+        )
+    except Exception as exc:
+        logger.warning(f"  Monte Carlo simulation failed: {exc}")
+
+    # ── STEP 5c: Uplift Modeling (optional — pass --uplift) ───────────────────
+    uplift_results = {}
+    if args.uplift:
+        logger.info("\n[STEP 5c] Running Uplift Modeling (T-Learner proxy)...")
+        try:
+            qini_path = os.path.join(FIGURES_DIR, "07_qini_curve.png")
+            uplift_results = run_uplift_analysis(
+                weibull_decisions=weibull_decisions,
+                customer_df=customer_df,
+                save_path=qini_path,
+            )
+            logger.info(
+                f"  Persuadables: {uplift_results['persuadable_pct']:.1%} of INTERVENE | "
+                f"Qini coefficient: {uplift_results['qini_auc_ratio']:.4f}"
+            )
+            # Save uplift segment table
+            uplift_csv = os.path.join(REPORTS_DIR, "uplift_segments.csv")
+            uplift_results["uplift_df"][["CustomerID", "tau_hat", "uplift_segment"]].to_csv(
+                uplift_csv, index=False
+            )
+            logger.info(f"  Uplift segments saved -> {uplift_csv}")
+        except Exception as upexc:
+            logger.warning(f"  Uplift analysis failed: {upexc}")
     logger.info("\n[STEP 6] Evaluating models...")
 
-    c_index_weibull  = compute_c_index(waf, df_scaled_waf, model_name="WeibullAFT")
-    c_index_cox      = compute_c_index(cph, df_scaled_cph, model_name="CoxPH")
-    ibs              = compute_integrated_brier_score(waf, df_scaled_waf)
-    auc_df           = compute_time_dependent_auc(waf, df_scaled_waf)
+    c_index_weibull  = compute_c_index(waf, df_scaled_train_waf, model_name="WeibullAFT")
+    c_index_cox      = compute_c_index(cph, df_scaled_train_cph, model_name="CoxPH")
+    ibs              = compute_integrated_brier_score(waf, df_scaled_train_waf)
+    auc_df           = compute_time_dependent_auc(waf, df_scaled_train_waf)
     outreach_metrics = compute_outreach_efficiency(weibull_decisions, rfm_decisions)
     revenue_metrics  = compute_revenue_lift(weibull_decisions, rfm_decisions)
 
@@ -236,8 +463,114 @@ def main():
         auc_df=auc_df,
         outreach_metrics=outreach_metrics,
         revenue_metrics=revenue_metrics,
-        tau=args.tau,
+        tau=tau,
     )
+
+    # ── STEP 6b: Out-of-Sample (Stratified) C-index + IBS Validation ─────────
+    #
+    # Method: Stratified 80/20 random holdout (fit in STEP 2c / STEP 4).
+    # The test set was NEVER seen during training or preprocessor fitting.
+    #
+    # Why NOT temporal cohort splitting:
+    #   Late-cohort customers are systematically right-censored by the study
+    #   end date (administrative censoring), NOT by random dropout.  This
+    #   violates the Independent Censoring Assumption, shifts the T distribution
+    #   leftward, and inverts the concordance ranking (C-index 0.34 is an
+    #   artifact, not a real signal). Stratified random splitting preserves
+    #   the joint (T, E) distribution in both splits and gives unbiased OOS.
+    logger.info("\n[STEP 6b] Out-of-Sample (Stratified Holdout) Evaluation...")
+    logger.info(
+        f"  Test set: {len(df_scaled_test_waf):,} customers | "
+        f"churn rate: {df_scaled_test_waf['E'].mean()*100:.1f}%"
+    )
+
+    try:
+        # ── Weibull AFT OOS C-index ───────────────────────────────────────────
+        # model.score() uses the built-in concordance computation on df_test
+        oos_c_waf = waf.score(df_scaled_test_waf, scoring_method="concordance_index")
+
+        logger.info("  [WeibullAFT]")
+        logger.info(f"    C-index In-Sample (train) : {c_index_weibull:.4f}")
+        logger.info(f"    C-index OOS       (test)  : {oos_c_waf:.4f}")
+        gap_waf = c_index_weibull - oos_c_waf
+        if gap_waf > 0.05:
+            logger.warning(
+                f"    [OOS WARNING] Gap = {gap_waf:.4f} > 0.05 "
+                f"-- possible overfitting."
+            )
+        else:
+            logger.info(
+                f"    [OOS OK] Gap = {gap_waf:.4f} <= 0.05 "
+                f"-- generalisation is healthy."
+            )
+
+        # ── CoxPH OOS C-index ─────────────────────────────────────────────────
+        oos_c_cph = cph.score(df_scaled_test_cph, scoring_method="concordance_index")
+
+        logger.info("  [CoxPH]")
+        logger.info(f"    C-index In-Sample (train) : {c_index_cox:.4f}")
+        logger.info(f"    C-index OOS       (test)  : {oos_c_cph:.4f}")
+        gap_cph = c_index_cox - oos_c_cph
+        if gap_cph > 0.05:
+            logger.warning(
+                f"    [OOS WARNING] Gap = {gap_cph:.4f} > 0.05 "
+                f"-- possible overfitting."
+            )
+        else:
+            logger.info(
+                f"    [OOS OK] Gap = {gap_cph:.4f} <= 0.05 "
+                f"-- generalisation is healthy."
+            )
+
+        # ── OOS Integrated Brier Score (Weibull AFT on test set) ──────────────
+        logger.info("  Computing OOS Integrated Brier Score (WeibullAFT on test set)...")
+        ibs_oos = compute_integrated_brier_score(waf, df_scaled_test_waf)
+        logger.info(f"    IBS In-Sample : {ibs:.4f}")
+        logger.info(f"    IBS OOS       : {ibs_oos:.4f}  (target: < 0.25)")
+
+        # ── Summary table to stdout ───────────────────────────────────────────
+        print("\n" + "=" * 70)
+        print("  OOS GENERALIZATION REPORT (Stratified 80/20 Holdout)")
+        print("=" * 70)
+        print(f"  {'Model':<15} {'In-Sample C':>14} {'OOS C':>10} {'Gap':>8}")
+        print(f"  {'-'*15} {'-'*14} {'-'*10} {'-'*8}")
+        print(f"  {'WeibullAFT':<15} {c_index_weibull:>14.4f} {oos_c_waf:>10.4f} {gap_waf:>+8.4f}")
+        print(f"  {'CoxPH':<15} {c_index_cox:>14.4f} {oos_c_cph:>10.4f} {gap_cph:>+8.4f}")
+        print(f"  {'IBS (Weibull)':<15} {ibs:>14.4f} {ibs_oos:>10.4f} {'N/A':>8}")
+        print("=" * 70 + "\n")
+
+    except Exception as exc:
+        logger.warning(f"  OOS evaluation failed: {exc}")
+        oos_c_waf = None
+        ibs_oos = None
+
+    # Bundle metrics for saving
+    run_metrics = {
+        "c_index_weibull_train": c_index_weibull,
+        "c_index_weibull_oos":   oos_c_waf,
+        "c_index_cox_train":     c_index_cox,
+        "ibs_train":             ibs,
+        "cv_mean_c_index":       cv_mean_c,
+        "cv_std_c_index":        cv_std_c,
+        "outreach_efficiency":   outreach_metrics.get("efficiency_gain_pct", 0.0),
+        "revenue_lift":          revenue_metrics.get("revenue_precision_lift_pct", 0.0),
+        "uplift_qini":           uplift_results.get("qini_auc_ratio", None),
+        "uplift_persuadables":   uplift_results.get("persuadable_pct", None),
+        "n_test_customers":      len(df_scaled_test_waf),
+        "test_churn_rate":       df_scaled_test_waf['E'].mean(),
+    }
+
+    # ── MLflow: Log all metrics ───────────────────────────────────────────────
+    if _use_mlflow:
+        try:
+            # Filter None values
+            mlflow.log_metrics({k: v for k, v in run_metrics.items() if v is not None})
+            mlflow.log_artifacts(FIGURES_DIR, artifact_path="figures")
+            mlflow.end_run()
+            logger.info("[MLflow] Run logged and closed.")
+        except Exception as _mlf_exc:
+            logger.warning(f"[MLflow] Failed to log metrics: {_mlf_exc}")
+
 
     # ── STEP 7: Serialize Models & Data for Dashboard ─────────────────────────
     logger.info("\n[STEP 7] Serializing models and processed data...")
@@ -248,7 +581,11 @@ def main():
         rfm_df=rfm_df,
         weibull_decisions=weibull_decisions,
         df_scaled_waf=df_scaled_waf,
-        tau=args.tau,
+        tau=tau,
+        models_dir=MODELS_DIR,
+        active_features_waf=active_features_waf,
+        monte_carlo_results=monte_carlo_results,
+        metrics=run_metrics,
     )
 
     # ── STEP 8: Visualizations ────────────────────────────────────────────────
@@ -299,7 +636,8 @@ def main():
             plot_shap_summary(
                 waf, df_scaled_waf,
                 feature_cols=SURVIVAL_FEATURES,
-                save_path=os.path.join(FIGURES_DIR, "06_shap_summary.png")
+                save_path=os.path.join(FIGURES_DIR, "06_shap_summary.png"),
+                save_csv_path=os.path.join(REPORTS_DIR, "shap_feature_importance.csv"),
             )
         except Exception as e:
             logger.warning(f"SHAP plot failed: {e}")
