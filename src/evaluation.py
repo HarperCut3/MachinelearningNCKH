@@ -90,12 +90,19 @@ def compute_integrated_brier_score(
     """
     Compute the Integrated Brier Score (IBS) for a Weibull AFT model.
 
-    The Brier Score at time t:
-      BS(t) = (1/n) sum_i [S_hat(t|x_i) - 1(T_i > t)]^2
+    Two-tier implementation:
+    ─────────────────────────
+    Tier 1 (preferred, scientifically correct):
+        Uses ``scikit-survival`` (sksurv) IPCW-weighted IBS.
+        IPCW = Inverse Probability of Censoring Weighting.
+        This correctly handles right-censored observations and is required
+        for datasets with heavy censoring (> 40% censored).
+        Install: pip install scikit-survival
 
-    IBS integrates BS(t) over the observation window using the trapezoidal rule.
-    Note: This is a simplified (non-IPCW) version. For publication-grade results
-    with high censoring, use scikit-survival's IPCW-weighted IBS.
+    Tier 2 (fallback when sksurv not available):
+        Plain Brier Score without censoring weights.
+        Biased upward when censoring is heavy, but acceptable for exploratory
+        analysis on low-censoring datasets (e.g. CDNOW 86% churn rate).
 
     Parameters
     ----------
@@ -112,25 +119,45 @@ def compute_integrated_brier_score(
         IBS value. Lower is better. IBS < 0.25 -> better than random.
     """
     T_obs = df_scaled["T"].values
-    t_min = T_obs.min()
-    t_max = T_obs.max()
-    t_grid = np.linspace(t_min, t_max, t_grid_steps)
+    E_obs = df_scaled["E"].values.astype(bool)
+    t_lo = float(np.percentile(T_obs, 5))
+    t_hi = float(np.percentile(T_obs, 95))
+    if t_hi <= t_lo:
+        t_hi = float(T_obs.max())
+    t_grid = np.linspace(t_lo, t_hi, t_grid_steps)
 
-    # Survival function matrix: shape (t_grid_steps, n_customers)
+    # ── Tier 1: IPCW via scikit-survival ─────────────────────────────────────
+    try:
+        from sksurv.metrics import integrated_brier_score as _ipcw_ibs
+        from sksurv.util import Surv
+
+        y_structured = Surv.from_arrays(event=E_obs, time=T_obs)
+        # sksurv needs survival prob matrix shape (n_times, n_customers).T
+        S_hat_full = model.predict_survival_function(df_scaled, times=t_grid).values  # (T, N)
+        # sksurv expects a list of step functions — supply as 2D array (N, T)
+        ibs = _ipcw_ibs(y_structured, y_structured, t_grid, S_hat_full.T)
+        logger.info(f"[WeibullAFT] IBS (IPCW-weighted, sksurv): {ibs:.4f}")
+        return float(ibs)
+
+    except ImportError:
+        logger.warning(
+            "[IBS] scikit-survival not installed — using non-IPCW Brier Score (fallback). "
+            "Install for publication-grade results: pip install scikit-survival"
+        )
+    except Exception as exc:
+        logger.warning(f"[IBS] sksurv IPCW failed ({exc}). Using non-IPCW fallback.")
+
+    # ── Tier 2: Fallback — plain non-IPCW Brier Score ────────────────────────
     S_hat = model.predict_survival_function(df_scaled, times=t_grid).values  # (T, N)
-
     brier_scores = []
     for j, t in enumerate(t_grid):
         y_true = (T_obs > t).astype(float)
-        y_pred = S_hat[j, :]
-        bs_t = np.mean((y_pred - y_true) ** 2)
-        brier_scores.append(bs_t)
+        brier_scores.append(np.mean((S_hat[j, :] - y_true) ** 2))
 
-    brier_scores = np.array(brier_scores)
-    ibs = trapezoid(brier_scores, t_grid) / (t_max - t_min)
-
-    logger.info(f"[WeibullAFT] Integrated Brier Score (IBS): {ibs:.4f}")
+    ibs = trapezoid(np.array(brier_scores), t_grid) / (t_hi - t_lo)
+    logger.info(f"[WeibullAFT] IBS (non-IPCW fallback): {ibs:.4f}")
     return ibs
+
 
 
 def compute_time_dependent_auc(
@@ -152,18 +179,45 @@ def compute_time_dependent_auc(
     df_scaled : pd.DataFrame
         Scaled feature DataFrame with T and E columns.
     eval_times : list of float, optional
-        Time points for AUC evaluation. Defaults to [30, 60, 90, 180, 270, 365].
+        Time points for AUC evaluation. If None, auto-derived from the
+        dataset's T range using 6 evenly-spaced quantiles between the 5th
+        and 95th percentile. This ensures no eval point falls outside the
+        observed survival times, preventing extrapolation crashes on short
+        datasets (e.g. Ta Feng = 120 days, CDNOW, etc.).
 
     Returns
     -------
     pd.DataFrame
         DataFrame with columns [time, auc, n_events].
     """
-    if eval_times is None:
-        eval_times = [30, 60, 90, 180, 270, 365]
-
     T_obs = df_scaled["T"].values
     E_obs = df_scaled["E"].values
+
+    if eval_times is None:
+        # Auto-derive from data: 6 evenly-spaced points within [p5, p95]
+        # Using percentiles (not min/max) avoids extreme-edge artifacts.
+        t_lo = float(np.percentile(T_obs, 5))
+        t_hi = float(np.percentile(T_obs, 95))
+        # Clamp to at least 2 distinct points
+        if t_hi <= t_lo:
+            t_hi = float(T_obs.max())
+        eval_times = list(np.linspace(t_lo, t_hi, 6).round(1))
+        logger.info(
+            f"[TdAUC] Auto eval_times from data range "
+            f"[{t_lo:.1f}d, {t_hi:.1f}d]: {eval_times}"
+        )
+    else:
+        # Filter caller-provided list to stay within observed range
+        t_min_obs, t_max_obs = float(T_obs.min()), float(T_obs.max())
+        filtered = [t for t in eval_times if t_min_obs <= t <= t_max_obs]
+        if not filtered:
+            filtered = [float(np.median(T_obs))]  # last resort
+        if len(filtered) < len(eval_times):
+            logger.warning(
+                f"[TdAUC] {len(eval_times) - len(filtered)} eval_times outside "
+                f"data range [{t_min_obs:.1f}d, {t_max_obs:.1f}d] — dropped."
+            )
+        eval_times = filtered
 
     S_hat = model.predict_survival_function(df_scaled, times=eval_times).values
 

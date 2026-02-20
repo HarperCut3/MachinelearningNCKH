@@ -42,6 +42,7 @@ Usage
 import logging
 import warnings
 import numpy as np
+from scipy.integrate import trapezoid as _trapz
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -337,8 +338,8 @@ def run_uplift_analysis(
     qini_df = _compute_qini(uplift_df)
 
     # 7. Qini coefficient (AUC ratio)
-    qini_auc  = np.trapz(qini_df["qini_gain"],   qini_df["pct_targeted"])
-    rand_auc  = np.trapz(qini_df["random_baseline"], qini_df["pct_targeted"])
+    qini_auc  = _trapz(qini_df["qini_gain"],      qini_df["pct_targeted"])
+    rand_auc  = _trapz(qini_df["random_baseline"], qini_df["pct_targeted"])
     qini_coef = (qini_auc / rand_auc) if rand_auc != 0 else 0.0
     logger.info("[Uplift] Qini coefficient (model AUC / random AUC): %.4f", qini_coef)
 

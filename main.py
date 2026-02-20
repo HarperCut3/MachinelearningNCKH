@@ -262,7 +262,7 @@ def main():
         snapshot = get_snapshot_date_tafeng(df_clean)
     elif args.dataset == "cdnow":
         df_clean = load_cdnow(CDNOW_DATA_PATH)
-        snapshot = df_clean["InvoiceDate"].max()
+        snapshot = df_clean["InvoiceDate"].max() + pd.Timedelta(days=1)  # consistent with UCI/TaFeng
     else:
         # UCI Online Retail (default)
         df_clean = load_and_clean(DATA_PATH)
