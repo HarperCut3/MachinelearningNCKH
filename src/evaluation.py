@@ -205,6 +205,7 @@ def compute_integrated_brier_score(
     model: WeibullAFTFitter,
     df_scaled: pd.DataFrame,
     t_grid_steps: int = 100,
+    force_naive: bool = False,  # E6: force non-IPCW for ablation S4
 ) -> float:
     """
     Compute the Integrated Brier Score (IBS) for a Weibull AFT model.
@@ -246,25 +247,26 @@ def compute_integrated_brier_score(
     t_grid = np.linspace(t_lo, t_hi, t_grid_steps)
 
     # ── Tier 1: IPCW via scikit-survival ─────────────────────────────────────
-    try:
-        from sksurv.metrics import integrated_brier_score as _ipcw_ibs
-        from sksurv.util import Surv
+    if not force_naive:
+        try:
+            from sksurv.metrics import integrated_brier_score as _ipcw_ibs
+            from sksurv.util import Surv
 
-        y_structured = Surv.from_arrays(event=E_obs, time=T_obs)
-        # sksurv needs survival prob matrix shape (n_times, n_customers).T
-        S_hat_full = model.predict_survival_function(df_scaled, times=t_grid).values  # (T, N)
-        # sksurv expects a list of step functions — supply as 2D array (N, T)
-        ibs = _ipcw_ibs(y_structured, y_structured, t_grid, S_hat_full.T)
-        logger.info(f"[WeibullAFT] IBS (IPCW-weighted, sksurv): {ibs:.4f}")
-        return float(ibs)
+            y_structured = Surv.from_arrays(event=E_obs, time=T_obs)
+            # sksurv needs survival prob matrix shape (n_times, n_customers).T
+            S_hat_full = model.predict_survival_function(df_scaled, times=t_grid).values  # (T, N)
+            # sksurv expects a list of step functions — supply as 2D array (N, T)
+            ibs = _ipcw_ibs(y_structured, y_structured, t_grid, S_hat_full.T)
+            logger.info(f"[WeibullAFT] IBS (IPCW-weighted, sksurv): {ibs:.4f}")
+            return float(ibs)
 
-    except ImportError:
-        logger.warning(
-            "[IBS] scikit-survival not installed — using non-IPCW Brier Score (fallback). "
-            "Install for publication-grade results: pip install scikit-survival"
-        )
-    except Exception as exc:
-        logger.warning(f"[IBS] sksurv IPCW failed ({exc}). Using non-IPCW fallback.")
+        except ImportError:
+            logger.warning(
+                "[IBS] scikit-survival not installed — using non-IPCW Brier Score (fallback). "
+                "Install for publication-grade results: pip install scikit-survival"
+            )
+        except Exception as exc:
+            logger.warning(f"[IBS] sksurv IPCW failed ({exc}). Using non-IPCW fallback.")
 
     # ── Tier 2: Fallback — plain non-IPCW Brier Score ────────────────────────
     S_hat = model.predict_survival_function(df_scaled, times=t_grid).values  # (T, N)

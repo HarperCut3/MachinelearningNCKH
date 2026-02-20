@@ -141,6 +141,10 @@ def parse_args():
         "--benchmark", action="store_true",
         help="E2: Run pipeline on ALL registered datasets and produce comparison table"
     )
+    parser.add_argument(
+        "--ablation", action="store_true",
+        help="E6: Run ablation study (5 scenarios) to prove each module's value"
+    )
     return parser.parse_args()
 
 
@@ -729,6 +733,17 @@ def main():
             logger.info(f"[E2] Benchmark complete — {len(bench_df)} datasets compared.")
         except Exception as e:
             logger.warning(f"[E2] Benchmark failed: {e}")
+
+    # ── E6: Ablation Study ───────────────────────────────────────────────────
+    if getattr(args, 'ablation', False):
+        logger.info("\n[E6] Running Ablation Study (5 scenarios)...")
+        try:
+            from src.ablation import AblationRunner
+            runner = AblationRunner()
+            ablation_df = runner.run_suite(args.dataset, base_tau=args.tau)
+            logger.info(f"[E6] Ablation complete — {len(ablation_df)} scenarios tested.")
+        except Exception as e:
+            logger.warning(f"[E6] Ablation study failed: {e}")
 
     logger.info("\n[DONE] Pipeline completed successfully.")
     logger.info(f"  Figures  -> {FIGURES_DIR}")

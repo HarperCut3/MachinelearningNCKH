@@ -170,6 +170,7 @@ def make_intervention_decisions(
     theta_s: float = DEFAULT_SURVIVAL_FLOOR,
     p_response: float = DEFAULT_RESPONSE_RATE,
     cost_per_contact: float = DEFAULT_COST_PER_CONTACT,
+    vip_pct: float = None,  # E6: override VIP guard percentile (1.0 = disable)
 ) -> pd.DataFrame:
     """
     Apply the full decision policy to all customers.
@@ -228,8 +229,8 @@ def make_intervention_decisions(
     # E4: VIP Sleeping Dog Guard — prevent spamming high-value happy customers.
     # If a customer has very high Monetary (top percentile) but very LOW hazard,
     # they are a VIP who is NOT at risk → force WAIT even if EVI > 0.
-    vip_pct = _policy_cfg.get("vip_threshold_percentile", 0.90)
-    monetary_threshold = signals["Monetary"].quantile(vip_pct)
+    vip_pct_val = vip_pct if vip_pct is not None else _policy_cfg.get("vip_threshold_percentile", 0.90)
+    monetary_threshold = signals["Monetary"].quantile(vip_pct_val)
     is_vip_sleeping_dog = (
         (~is_lost)
         & (signals["hazard_now"] < theta_h * 0.5)
@@ -239,7 +240,7 @@ def make_intervention_decisions(
     if n_vip_guarded > 0:
         logger.info(
             f"[VIP Guard] Protected {n_vip_guarded} VIP Sleeping Dogs "
-            f"(Monetary > P{vip_pct*100:.0f}={monetary_threshold:.1f}, "
+            f"(Monetary > P{vip_pct_val*100:.0f}={monetary_threshold:.1f}, "
             f"hazard < {theta_h*0.5:.4f})"
         )
 

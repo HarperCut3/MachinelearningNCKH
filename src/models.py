@@ -229,6 +229,7 @@ def train_weibull_aft(
     customer_df: pd.DataFrame,
     penalizer: float = 0.01,
     penalizer_grid: list = None,
+    vif_threshold: float = 5.0,  # E6: pass inf to disable VIF guard
 ) -> tuple:
     """
     Fit a Weibull Accelerated Failure Time model with scientific safeguards.
@@ -282,7 +283,7 @@ def train_weibull_aft(
     df_scaled_full["E"] = customer_df["E"].values
 
     # ── Phase 4 Task 2: VIF multicollinearity check ───────────────────────────
-    active_features = _check_vif(df_scaled_full, input_features)
+    active_features = _check_vif(df_scaled_full, input_features, vif_threshold=vif_threshold)
 
     # Rebuild df_scaled with only active features + T, E (drop pruned cols)
     df_scaled = df_scaled_full[active_features + ["T", "E"]].copy()
