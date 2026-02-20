@@ -58,6 +58,7 @@ import logging
 import os
 import numpy as np
 import pandas as pd
+from src.dataset_registry import get_currency_symbol, get_currency_code
 
 logger = logging.getLogger(__name__)
 
@@ -298,14 +299,16 @@ def run_monte_carlo_simulation(
     n_rfm_funded       = int(np.median(n_rfm_funded_arr))
 
     # ── Logging ───────────────────────────────────────────────────────────────
+    _sym = get_currency_symbol()
+    _code = get_currency_code()
     logger.info("[MonteCarlo] 95%% Confidence Intervals (budget-constrained, Sleeping Dog penalised):")
     logger.info(
-        "  Weibull Profit  (GBP): lower=£%.0f | median=£%.0f | upper=£%.0f  "
+        f"  Weibull Profit  ({_code}): lower={_sym}%.0f | median={_sym}%.0f | upper={_sym}%.0f  "
         "[%d contacts funded]",
         w_ci[0], w_ci[1], w_ci[2], n_weibull_funded,
     )
     logger.info(
-        "  RFM Profit      (GBP): lower=£%.0f | median=£%.0f | upper=£%.0f  "
+        f"  RFM Profit      ({_code}): lower={_sym}%.0f | median={_sym}%.0f | upper={_sym}%.0f  "
         "[%d contacts funded | %d Sleeping Dogs penalised]",
         r_ci[0], r_ci[1], r_ci[2], n_rfm_funded, n_sleeping_dogs,
     )

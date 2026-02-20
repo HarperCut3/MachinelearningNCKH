@@ -47,6 +47,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from src.dataset_registry import get_currency_code
 
 logger = logging.getLogger(__name__)
 
@@ -196,9 +197,9 @@ def _assign_uplift_segment(row: pd.Series) -> str:
 
 def _compute_qini(df: pd.DataFrame, outcome_col: str = "Monetary") -> pd.DataFrame:
     """
-    Compute Qini curve for incremental gain assessment.
+    Compute Qini curve for incremental gain assessment (vectorized O(n)).
 
-    Qini(k) = (n_t_k / n_t) * Y_t - (n_c_k / n_c) * Y_c
+    Qini(k) = Y_t_top_k - (n_t_k / n_t) * Y_t_all
     where k = top-k percentile targeted by uplift score.
 
     Returns
@@ -206,8 +207,8 @@ def _compute_qini(df: pd.DataFrame, outcome_col: str = "Monetary") -> pd.DataFra
     pd.DataFrame
         Columns: ['pct_targeted', 'qini_gain', 'random_baseline']
     """
-    df_sorted = df.sort_values("tau_hat", ascending=False).copy()
-    n = len(df_sorted)
+    df_sorted = df.sort_values("tau_hat", ascending=False).reset_index(drop=True)
+    n   = len(df_sorted)
     n_t = (df_sorted["treatment"] == 1).sum()
     n_c = n - n_t
 
@@ -215,24 +216,23 @@ def _compute_qini(df: pd.DataFrame, outcome_col: str = "Monetary") -> pd.DataFra
         logger.warning("[Uplift] Qini curve requires both treated and control groups.")
         return pd.DataFrame({"pct_targeted": [0, 1], "qini_gain": [0, 0], "random_baseline": [0, 0]})
 
-    qini   = []
-    random = []
-    for k in range(1, n + 1):
-        top_k = df_sorted.iloc[:k]
-        n_t_k = (top_k["treatment"] == 1).sum()
-        n_c_k = (top_k["treatment"] == 0).sum()
-        Y_t   = top_k[top_k["treatment"] == 1][outcome_col].sum()
-        Y_c   = top_k[top_k["treatment"] == 0][outcome_col].sum()
-        Y_t_all = df_sorted[df_sorted["treatment"] == 1][outcome_col].sum()
-        Y_c_all = df_sorted[df_sorted["treatment"] == 0][outcome_col].sum()
-        q = (Y_t - (Y_t_all * n_c_k / n_c)) if n_c > 0 else 0
-        qini.append(q)
-        random.append(Y_t_all * k / n)
+    treat_flag = (df_sorted["treatment"] == 1).values
+    outcome    = df_sorted[outcome_col].values
+
+    Y_t_all = outcome[treat_flag].sum()
+    Y_c_all = outcome[~treat_flag].sum()
+
+    # Vectorized cumulative sums
+    cum_Y_t  = np.cumsum(outcome * treat_flag)           # cumulative treated revenue
+    cum_n_c  = np.cumsum(~treat_flag).astype(float)     # cumulative control count
+
+    qini_gain        = cum_Y_t - (Y_t_all * cum_n_c / n_c)
+    random_baseline  = Y_t_all * np.arange(1, n + 1) / n
 
     return pd.DataFrame({
-        "pct_targeted":   np.linspace(0, 1, n + 1)[1:],
-        "qini_gain":      qini,
-        "random_baseline": random,
+        "pct_targeted":    np.linspace(0, 1, n + 1)[1:],
+        "qini_gain":       qini_gain,
+        "random_baseline": random_baseline,
     })
 
 
@@ -251,7 +251,7 @@ def _plot_qini(qini_df: pd.DataFrame, save_path: str = None) -> plt.Figure:
                     qini_df["qini_gain"], qini_df["random_baseline"],
                     alpha=0.15, color="#00b4d8")
     ax.set_xlabel("% Population Targeted", fontsize=11)
-    ax.set_ylabel("Incremental Revenue (GBP)", fontsize=11)
+    ax.set_ylabel(f"Incremental Revenue ({get_currency_code()})", fontsize=11)
     ax.set_title("Qini Curve — Uplift vs Random Targeting", fontsize=13, fontweight="bold")
     ax.legend()
     fig.tight_layout()

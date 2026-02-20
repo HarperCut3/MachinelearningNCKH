@@ -47,10 +47,58 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Feature columns used by survival models (Weibull AFT, CoxPH)
+# These are used as a fallback / for save_artifacts metadata.
+# Actual model training uses get_survival_features(customer_df) which
+# auto-discovers numeric columns from the data — adding a new feature to
+# feature_engine.py will automatically include it in models without any
+# manual list update.
 SURVIVAL_FEATURES = [
     "Recency", "Frequency", "Monetary",
     "InterPurchaseTime", "GapDeviation", "SinglePurchase",
 ]
+
+# Columns that are never input features regardless of what's in the DataFrame
+_NON_FEATURE_COLS = {"T", "E", "CustomerID"}
+
+
+def get_survival_features(customer_df: pd.DataFrame) -> list:
+    """
+    Auto-discover survival model feature columns from a customer DataFrame.
+
+    Rules:
+      - Must be numeric (int or float)
+      - Must NOT be a survival target column: T, E
+      - Must NOT be an identifier: CustomerID
+      - Must NOT contain all-NaN values
+
+    Falls back to the static ``SURVIVAL_FEATURES`` list if no numeric columns
+    are found (e.g. in tests with minimal synthetic data).
+
+    Parameters
+    ----------
+    customer_df : pd.DataFrame
+        Customer-level feature DataFrame (output of build_customer_features).
+
+    Returns
+    -------
+    list of str
+        Feature column names to use for model training.
+    """
+    numeric_cols = customer_df.select_dtypes(include=[np.number]).columns.tolist()
+    features = [
+        c for c in numeric_cols
+        if c not in _NON_FEATURE_COLS
+        and customer_df[c].notna().any()
+    ]
+    if not features:
+        logger.warning(
+            "[get_survival_features] No numeric features discovered — "
+            "falling back to static SURVIVAL_FEATURES list."
+        )
+        return [f for f in SURVIVAL_FEATURES if f in customer_df.columns]
+    logger.info(f"[get_survival_features] Auto-discovered {len(features)} features: {features}")
+    return features
+
 
 # Feature columns for Logistic Regression (Recency EXCLUDED to prevent leakage)
 # E = (Recency > tau) => including Recency gives AUC = 1.0 trivially
@@ -58,6 +106,7 @@ LOGISTIC_FEATURES = [
     "Frequency", "Monetary",
     "InterPurchaseTime", "GapDeviation", "SinglePurchase",
 ]
+
 
 
 def _get_preprocessor() -> Pipeline:
@@ -218,17 +267,22 @@ def train_weibull_aft(
     if penalizer_grid is None:
         penalizer_grid = _WEIBULL_PENALIZER_GRID
 
+    # ── B2: Auto-discover features from data ─────────────────────────────────
+    # This replaces the hardcoded SURVIVAL_FEATURES reference so that any new
+    # feature added to feature_engine.py is automatically picked up here.
+    input_features = get_survival_features(customer_df)
+
     # ── Scale features ───────────────────────────────────────────────────────
     preprocessor = _get_preprocessor()
-    X_scaled = preprocessor.fit_transform(customer_df[SURVIVAL_FEATURES])
+    X_scaled = preprocessor.fit_transform(customer_df[input_features])
     df_scaled_full = pd.DataFrame(
-        X_scaled, columns=SURVIVAL_FEATURES, index=customer_df.index
+        X_scaled, columns=input_features, index=customer_df.index
     )
     df_scaled_full["T"] = customer_df["T"].values
     df_scaled_full["E"] = customer_df["E"].values
 
     # ── Phase 4 Task 2: VIF multicollinearity check ───────────────────────────
-    active_features = _check_vif(df_scaled_full, SURVIVAL_FEATURES)
+    active_features = _check_vif(df_scaled_full, input_features)
 
     # Rebuild df_scaled with only active features + T, E (drop pruned cols)
     df_scaled = df_scaled_full[active_features + ["T", "E"]].copy()
@@ -335,15 +389,18 @@ def train_coxph(
     if penalizer_grid is None:
         penalizer_grid = [0.01, 0.1, 0.5, 1.0]
 
+    # ── B2: Auto-discover features from data ─────────────────────────────────
+    input_features = get_survival_features(customer_df)
+
     # ── Scale features ────────────────────────────────────────────────────────
     preprocessor = _get_preprocessor()
-    X_scaled = preprocessor.fit_transform(customer_df[SURVIVAL_FEATURES])
-    df_scaled_full = pd.DataFrame(X_scaled, columns=SURVIVAL_FEATURES, index=customer_df.index)
+    X_scaled = preprocessor.fit_transform(customer_df[input_features])
+    df_scaled_full = pd.DataFrame(X_scaled, columns=input_features, index=customer_df.index)
     df_scaled_full["T"] = customer_df["T"].values
     df_scaled_full["E"] = customer_df["E"].values
 
     # ── VIF multicollinearity check ───────────────────────────────────────────
-    active_features = _check_vif(df_scaled_full, SURVIVAL_FEATURES)
+    active_features = _check_vif(df_scaled_full, input_features)
     df_scaled = df_scaled_full[active_features + ["T", "E"]].copy()
 
     # ── Grid search via k-fold cross-validation ───────────────────────────────

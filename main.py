@@ -39,9 +39,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # Project imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.data_loader         import load_and_clean, get_snapshot_date
-from src.data_loader_tafeng  import load_and_clean_tafeng, get_snapshot_date_tafeng
-from src.data_loader_cdnow   import load_data as load_cdnow
+from src.dataset_registry   import get_dataset, list_datasets
 from src.feature_engine import build_customer_features, sensitivity_analysis_tau
 from src.models         import (
     train_weibull_aft, train_coxph, train_logistic, rfm_segment,
@@ -67,11 +65,6 @@ from src.visualization  import (
     plot_decision_distribution,
     plot_brier_score_over_time,
 )
-
-# Configuration
-DATA_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "raw", "Online Retail.xlsx")
-TAFENG_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "raw", "ta_feng_all_months_merged.csv")
-CDNOW_DATA_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "raw", "CDNOW_master.txt")
 
 # Timestamped log so every run preserves its own file
 import datetime as _dt
@@ -112,8 +105,13 @@ def parse_args():
         help="Run sensitivity analysis across tau in {60, 90, 120}"
     )
     parser.add_argument(
-        "--dataset", choices=["uci", "tafeng", "cdnow"], default="uci",
-        help="Which dataset to run the pipeline on: 'uci', 'tafeng', or 'cdnow'"
+        "--dataset",
+        choices=[name for name, _ in list_datasets()],
+        default="uci",
+        help=(
+            "Dataset to run. Choices auto-derived from DatasetRegistry: "
+            + ", ".join(f"'{n}' ({d})" for n, d in list_datasets())
+        ),
     )
     parser.add_argument(
         "--uplift", action="store_true",
@@ -257,16 +255,11 @@ def main():
     # ── STEP 1: Load & Clean Data ─────────────────────────────────────────────
     logger.info(f"\n[STEP 1] Loading and cleaning dataset ({args.dataset.upper()})...")
 
-    if args.dataset == "tafeng":
-        df_clean = load_and_clean_tafeng(TAFENG_DATA_PATH)
-        snapshot = get_snapshot_date_tafeng(df_clean)
-    elif args.dataset == "cdnow":
-        df_clean = load_cdnow(CDNOW_DATA_PATH)
-        snapshot = df_clean["InvoiceDate"].max() + pd.Timedelta(days=1)  # consistent with UCI/TaFeng
-    else:
-        # UCI Online Retail (default)
-        df_clean = load_and_clean(DATA_PATH)
-        snapshot = get_snapshot_date(df_clean)
+    ds = get_dataset(args.dataset)
+    logger.info(f"  Dataset : {ds.display}")
+    logger.info(f"  Path    : {ds.data_path}")
+    df_clean = ds.loader_fn(ds.data_path)
+    snapshot = ds.snapshot_fn(df_clean)
 
     # ── STEP 1b: Auto-Tau Sanity Check ────────────────────────────────────────
     dataset_duration = (df_clean["InvoiceDate"].max() - df_clean["InvoiceDate"].min()).days

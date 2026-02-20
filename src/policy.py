@@ -218,16 +218,18 @@ def make_intervention_decisions(
         - cost_per_contact
     )
 
-    # ── Apply decision rule ───────────────────────────────────────────────────
-    def _decide(row):
-        if row["survival_now"] < theta_s:
-            return "LOST"
-        elif row["hazard_now"] > theta_h and row["evi"] > 0:
-            return "INTERVENE"
-        else:
-            return "WAIT"
+    # ── Apply decision rule (vectorized) ─────────────────────────────────────
+    # LOST   : S(t_now) < theta_s
+    # INTERVENE : h(t_now) > theta_h AND EVI > 0
+    # WAIT   : everything else
+    is_lost      = signals["survival_now"] < theta_s
+    is_intervene = (~is_lost) & (signals["hazard_now"] > theta_h) & (signals["evi"] > 0)
 
-    signals["decision"] = signals.apply(_decide, axis=1)
+    signals["decision"] = np.select(
+        [is_lost, is_intervene],
+        ["LOST",  "INTERVENE"],
+        default="WAIT",
+    )
 
     # ── Add CustomerID ────────────────────────────────────────────────────────
     signals.index.name = "CustomerID"

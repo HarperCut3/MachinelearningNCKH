@@ -32,6 +32,7 @@ import pandas as pd
 from lifelines import WeibullAFTFitter, CoxPHFitter
 from sklearn.metrics import roc_auc_score
 from scipy.integrate import trapezoid
+from src.dataset_registry import get_currency_symbol, get_currency_code
 
 logger = logging.getLogger(__name__)
 
@@ -445,8 +446,8 @@ def compute_revenue_lift(
 
     logger.info(
         f"Revenue Precision Lift | "
-        f"Weibull avg EVI: GBP {weibull_evi_avg:.2f} | "
-        f"RFM avg EVI: GBP {rfm_evi_avg:.2f} | "
+        f"Weibull avg EVI: {get_currency_code()} {weibull_evi_avg:.2f} | "
+        f"RFM avg EVI: {get_currency_code()} {rfm_evi_avg:.2f} | "
         f"Precision lift: {precision_lift:.1f}%"
     )
     return metrics
@@ -491,7 +492,7 @@ def print_full_report(
     print(f"  RFM intervention rate         : {outreach_metrics['rfm_intervene_rate']:.1f}%")
     print(f"  Contacts avoided              : {outreach_metrics['contacts_avoided']:,} ({outreach_metrics['contacts_avoided_pct']:.1f}%)")
     print(f"  Outreach efficiency gain      : {outreach_metrics['efficiency_gain_pct']:.1f}%  (target: >= 20%)")
-    print(f"  Weibull avg EVI per contact   : GBP {revenue_metrics['avg_evi_weibull']:.2f}")
-    print(f"  RFM avg EVI per contact       : GBP {revenue_metrics['avg_evi_rfm_proxy']:.2f}")
+    print(f"  Weibull avg EVI per contact   : {get_currency_symbol()}{revenue_metrics['avg_evi_weibull']:.2f}")
+    print(f"  RFM avg EVI per contact       : {get_currency_symbol()}{revenue_metrics['avg_evi_rfm_proxy']:.2f}")
     print(f"  Revenue precision lift        : {revenue_metrics['revenue_precision_lift_pct']:.1f}%  (target: >= 20%)")
     print(f"\n{sep}\n")
