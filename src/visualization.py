@@ -310,3 +310,67 @@ def plot_brier_score_over_time(
         fig.savefig(save_path, bbox_inches="tight")
         logger.info(f"Saved Brier score plot → {save_path}")
     return fig
+
+
+def plot_calibration(
+    lr_pipeline,
+    customer_df,
+    tau: int = 90,
+    n_bins: int = 10,
+    save_path: str = None,
+):
+    """
+    D1: Reliability Diagram (Calibration Curve) for the Logistic Regression classifier.
+
+    A well-calibrated model lies close to the diagonal.
+    Produces: reliability diagram + predicted-probability histogram.
+    """
+    from sklearn.calibration import calibration_curve
+    from src.models import LOGISTIC_FEATURES
+
+    available_features = [f for f in LOGISTIC_FEATURES if f in customer_df.columns]
+    if not available_features:
+        logger.warning("[Calibration] No logistic features found — skipping.")
+        return None
+
+    X = customer_df[available_features]
+    y = customer_df["E"].values
+
+    try:
+        prob_pos = lr_pipeline.predict_proba(X)[:, 1]
+    except Exception as exc:
+        logger.warning(f"[Calibration] predict_proba failed: {exc}")
+        return None
+
+    frac_pos, mean_pred = calibration_curve(y, prob_pos, n_bins=n_bins, strategy="uniform")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Reliability diagram
+    ax1.plot([0, 1], [0, 1], "k--", linewidth=1.5, label="Perfect calibration")
+    ax1.plot(mean_pred, frac_pos, "o-", color="#e74c3c",
+             linewidth=2, markersize=6, label="Logistic Regression")
+    ax1.fill_between(mean_pred, frac_pos, mean_pred, alpha=0.15, color="#e74c3c")
+    ax1.set_xlabel("Mean predicted probability", fontsize=11)
+    ax1.set_ylabel(f"Fraction of churners (E=1, tau={tau}d)", fontsize=11)
+    ax1.set_title("Reliability Diagram", fontsize=13, fontweight="bold")
+    ax1.legend()
+    ax1.set_xlim([0, 1])
+    ax1.set_ylim([0, 1])
+
+    # Probability histogram
+    ax2.hist(prob_pos[y == 1], bins=20, alpha=0.7, color="#e74c3c", label="Churners (E=1)")
+    ax2.hist(prob_pos[y == 0], bins=20, alpha=0.7, color="#3498db", label="Retained (E=0)")
+    ax2.set_xlabel("Predicted P(churn)", fontsize=11)
+    ax2.set_ylabel("Count", fontsize=11)
+    ax2.set_title("Predicted Probability Distribution", fontsize=13, fontweight="bold")
+    ax2.legend()
+
+    plt.suptitle(f"LR Calibration Analysis  (tau={tau}d)",
+                 fontsize=14, fontweight="bold", y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+        logger.info(f"Saved calibration plot → {save_path}")
+    return fig

@@ -45,3 +45,35 @@ economics:
   currency_symbol: "£"
   avg_margin_pct: 0.30         # average profit margin on products (30%)
   customer_acquisition_cost: 25.0  # estimated CAC in GBP
+
+# ── Per-Dataset Config Overrides (D3) ─────────────────────────────────────────
+# Each key matches the dataset name registered in src/dataset_registry.py.
+# Values here OVERRIDE the top-level defaults for that specific dataset.
+# This allows per-dataset tuning without code changes.
+# Supported override keys: any key from policy, monte_carlo, simulation.
+#
+# Example: CDNOW has shorter observation windows → lower hazard_threshold.
+dataset_overrides:
+  uci:
+    policy:
+      hazard_threshold: 0.01    # same as global default
+      response_rate: 0.15
+    simulation:
+      marketing_budget: 500.0
+
+  tafeng:
+    policy:
+      hazard_threshold: 0.015   # slightly more aggressive — grocery has higher churn velocity
+      response_rate: 0.12       # grocery loyalty programs have lower email response
+    simulation:
+      marketing_budget: 400.0   # smaller campaign budget
+
+  cdnow:
+    policy:
+      hazard_threshold: 0.008   # CDNOW: 1990s music retailer — lower baseline hazard
+      response_rate: 0.18       # direct mail era: higher response rate
+    simulation:
+      marketing_budget: 300.0
+    monte_carlo:
+      rfm_top_pct: 0.35         # more conservative RFM targeting for CDNOW
+

@@ -38,6 +38,118 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# D3: Per-Dataset Config Loader
+# =============================================================================
+
+def load_config_with_overrides(dataset: str) -> dict:
+    """
+    D3: Load simulation_params.yaml and merge dataset-specific overrides.
+
+    Override priority:
+        global config < dataset_overrides[dataset]
+
+    Parameters
+    ----------
+    dataset : str
+        Dataset name (e.g. 'uci', 'tafeng', 'cdnow').
+
+    Returns
+    -------
+    dict
+        Merged config with dataset-specific overrides applied.
+    """
+    import os
+    import yaml
+    import copy
+
+    cfg_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "config", "simulation_params.yaml"
+    )
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    overrides = cfg.get("dataset_overrides", {}).get(dataset, {})
+    if not overrides:
+        return cfg
+
+    # Deep merge: override only specifies sub-keys; rest of global config unchanged
+    merged = copy.deepcopy(cfg)
+    for section, section_vals in overrides.items():
+        if section in merged and isinstance(merged[section], dict):
+            merged[section].update(section_vals)
+        else:
+            merged[section] = section_vals
+    logger.info(f"[Config] Applied {dataset} overrides: {overrides}")
+    return merged
+
+
+# =============================================================================
+# D2: Bootstrap Confidence Interval for C-index
+# =============================================================================
+
+def bootstrap_c_index(
+    model,
+    df_scaled: pd.DataFrame,
+    n_boot: int = 500,
+    seed: int = 42,
+) -> tuple:
+    """
+    D2: Compute bootstrap 95% CI for the Weibull AFT C-index.
+
+    Resamples (with replacement) and computes concordance_index on each resample.
+    Does NOT refit the model — uses the fitted model's predict_median.
+
+    Parameters
+    ----------
+    model : WeibullAFTFitter  (already fitted)
+    df_scaled : pd.DataFrame  (contains T, E and scaled feature columns)
+    n_boot : int  — number of bootstrap iterations (default 500)
+    seed : int    — reproducibility seed
+
+    Returns
+    -------
+    tuple : (lower_95, median, upper_95)
+    """
+    from lifelines.utils import concordance_index
+
+    rng  = np.random.default_rng(seed)
+    T_all = df_scaled["T"].values
+    E_all = df_scaled["E"].values
+    feat_cols = [c for c in df_scaled.columns if c not in ("T", "E")]
+    n = len(T_all)
+
+    boot_scores = []
+    for _ in range(n_boot):
+        idx  = rng.integers(0, n, size=n)
+        T_b  = T_all[idx]
+        E_b  = E_all[idx]
+        df_b = df_scaled.iloc[idx][feat_cols].copy()
+        try:
+            T_hat = model.predict_median(df_b)
+            c = concordance_index(T_b, T_hat.values, E_b)
+            boot_scores.append(c)
+        except Exception:
+            pass
+
+    if not boot_scores:
+        logger.warning("[Bootstrap CI] All resamples failed.")
+        return (float("nan"), float("nan"), float("nan"))
+
+    arr = np.array(boot_scores)
+    lo, med, hi = (
+        float(np.percentile(arr,  2.5)),
+        float(np.percentile(arr, 50.0)),
+        float(np.percentile(arr, 97.5)),
+    )
+    logger.info(
+        f"[Bootstrap CI] C-index 95%% CI: [{lo:.4f}, {hi:.4f}]  "
+        f"(median={med:.4f}, n_boot={n_boot})"
+    )
+    return lo, med, hi
+
+
+# =============================================================================
 # Technical Metrics
 # =============================================================================
 

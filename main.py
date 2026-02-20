@@ -56,6 +56,8 @@ from src.evaluation     import (
     compute_revenue_lift,
     print_full_report,
     cross_validate_survival_model,
+    bootstrap_c_index,          # D2
+    load_config_with_overrides, # D3
 )
 from src.visualization  import (
     plot_kaplan_meier_by_segment,
@@ -64,7 +66,9 @@ from src.visualization  import (
     plot_shap_summary,
     plot_decision_distribution,
     plot_brier_score_over_time,
+    plot_calibration,           # D1
 )
+from src.reporter import generate_report  # D5
 
 # Timestamped log so every run preserves its own file
 import datetime as _dt
@@ -634,6 +638,48 @@ def main():
             )
         except Exception as e:
             logger.warning(f"SHAP plot failed: {e}")
+
+    # ── D1: Calibration Plot for LR ───────────────────────────────────────────
+    try:
+        plot_calibration(
+            lr_pipeline, customer_df, tau=args.tau,
+            save_path=os.path.join(FIGURES_DIR, "07_lr_calibration.png")
+        )
+    except Exception as e:
+        logger.warning(f"Calibration plot failed: {e}")
+
+    # ── D2: Bootstrap CI for C-index ──────────────────────────────────────────
+    boot_ci = None
+    try:
+        logger.info("[D2] Computing bootstrap 95% CI for C-index (n_boot=300)...")
+        boot_ci = bootstrap_c_index(waf, df_scaled_waf, n_boot=300)
+        lo, med, hi = boot_ci
+        logger.info(f"  C-index 95%% CI: [{lo:.4f}, {hi:.4f}]  (median={med:.4f})")
+    except Exception as e:
+        logger.warning(f"Bootstrap CI failed: {e}")
+
+    # ── D5: Markdown Auto-Report ──────────────────────────────────────────────
+    try:
+        ds_display = get_dataset(args.dataset).display
+        rpt_path = generate_report(
+            meta={
+                "n_customers":        len(customer_df),
+                "churn_rate":         customer_df["E"].mean(),
+                "active_features_waf": active_features_waf,
+                "tau":                args.tau,
+            },
+            metrics=run_metrics,
+            outreach=outreach_metrics,
+            revenue=revenue_metrics,
+            run_dir=RUN_DIR,
+            dataset_name=ds_display,
+            tau=args.tau,
+            c_index_boot_ci=boot_ci,
+            monte_carlo_results=monte_carlo_results if monte_carlo_results else None,
+        )
+        logger.info(f"[D5] Report saved → {rpt_path}")
+    except Exception as e:
+        logger.warning(f"Report generation failed: {e}")
 
     logger.info("\n[DONE] Pipeline completed successfully.")
     logger.info(f"  Figures  -> {FIGURES_DIR}")
