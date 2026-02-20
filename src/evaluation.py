@@ -127,8 +127,14 @@ def bootstrap_c_index(
         df_b = df_scaled.iloc[idx][feat_cols].copy()
         try:
             T_hat = model.predict_median(df_b)
-            c = concordance_index(T_b, T_hat.values, E_b)
-            boot_scores.append(c)
+            T_hat_vals = T_hat.values
+            # Filter out inf/-inf from predictions (Weibull may predict inf)
+            finite_mask = np.isfinite(T_hat_vals) & np.isfinite(T_b)
+            if finite_mask.sum() < 10:
+                continue  # too few valid predictions
+            c = concordance_index(T_b[finite_mask], T_hat_vals[finite_mask], E_b[finite_mask])
+            if np.isfinite(c):
+                boot_scores.append(c)
         except Exception:
             pass
 
@@ -144,7 +150,7 @@ def bootstrap_c_index(
     )
     logger.info(
         f"[Bootstrap CI] C-index 95%% CI: [{lo:.4f}, {hi:.4f}]  "
-        f"(median={med:.4f}, n_boot={n_boot})"
+        f"(median={med:.4f}, n_boot={n_boot}, n_valid={len(boot_scores)})"
     )
     return lo, med, hi
 

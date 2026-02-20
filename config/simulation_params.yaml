@@ -13,6 +13,7 @@ policy:
   survival_floor: 0.05         # S(t) below this → customer is LOST
   response_rate: 0.15          # 15% assumed email response/conversion rate
   cost_per_contact: 1.0        # £1.00 GBP per outreach contact
+  vip_threshold_percentile: 0.90  # E4: Monetary percentile above which VIP guard activates
 
 # ── Monte Carlo Simulator (src/simulator.py) ──────────────────────────────────
 monte_carlo:

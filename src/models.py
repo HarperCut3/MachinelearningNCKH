@@ -617,3 +617,108 @@ def rfm_segment(customer_df: pd.DataFrame, n_quintiles: int = 5) -> pd.DataFrame
     logger.info(f"RFM Segments:\n{segment_counts.to_string()}")
 
     return df
+
+
+# =============================================================================
+# 5. Model Selection Justification (E3: AIC / BIC Comparison)
+# =============================================================================
+
+def compare_survival_distributions(
+    customer_df: pd.DataFrame,
+    penalizer: float = 0.01,
+) -> dict:
+    """
+    E3: Compare Weibull, Log-Normal, and Log-Logistic AFT models via AIC/BIC.
+
+    Provides a scientific justification for choosing Weibull over alternatives.
+
+    AIC = 2k - 2 ln(L_hat)
+    BIC = k ln(n) - 2 ln(L_hat)
+
+    Where k = number of parameters, L_hat = maximum likelihood, n = sample size.
+
+    Parameters
+    ----------
+    customer_df : pd.DataFrame
+        Customer features (output of build_customer_features).
+    penalizer : float
+        L2 penalizer for all models (same penalty for fair comparison).
+
+    Returns
+    -------
+    dict
+        Keys: model_name -> {"aic": float, "bic": float, "c_index": float, "ll": float}
+        Plus "winner_aic" and "winner_bic" with the best model name.
+    """
+    from lifelines import LogNormalAFTFitter, LogLogisticAFTFitter
+
+    # Prepare data (same preprocessing for fair comparison)
+    prep = _get_preprocessor()
+    available = [f for f in SURVIVAL_FEATURES if f in customer_df.columns]
+    X = prep.fit_transform(customer_df[available])
+    df_s = pd.DataFrame(X, columns=available, index=customer_df.index)
+
+    # VIF check
+    active_feats = _check_vif(df_s, available)
+    df_s = df_s[active_feats].copy()
+    df_s["T"] = customer_df["T"].values
+    df_s["E"] = customer_df["E"].values
+    df_s = df_s[(df_s["T"] > 0) & df_s["T"].notna()]
+
+    n = len(df_s)
+    results = {}
+
+    models_to_try = [
+        ("Weibull AFT",     WeibullAFTFitter),
+        ("Log-Normal AFT",  LogNormalAFTFitter),
+        ("Log-Logistic AFT", LogLogisticAFTFitter),
+    ]
+
+    for name, ModelClass in models_to_try:
+        try:
+            m = ModelClass(penalizer=penalizer)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                m.fit(df_s, duration_col="T", event_col="E")
+
+            ll = m.log_likelihood_
+            k = m.params_.shape[0]
+            aic = 2 * k - 2 * ll
+            bic = k * np.log(n) - 2 * ll
+            c = m.concordance_index_
+
+            results[name] = {
+                "aic": round(aic, 2),
+                "bic": round(bic, 2),
+                "c_index": round(c, 4),
+                "log_likelihood": round(ll, 2),
+                "n_params": k,
+            }
+            logger.info(
+                f"[ModelSelection] {name:20s}  AIC={aic:10.2f}  BIC={bic:10.2f}  "
+                f"C-index={c:.4f}  LL={ll:.2f}  k={k}"
+            )
+        except Exception as exc:
+            logger.warning(f"[ModelSelection] {name} failed: {exc}")
+            results[name] = {"aic": float("inf"), "bic": float("inf"), "error": str(exc)}
+
+    # Determine winners
+    valid = {k: v for k, v in results.items() if "error" not in v}
+    if valid:
+        winner_aic = min(valid, key=lambda k: valid[k]["aic"])
+        winner_bic = min(valid, key=lambda k: valid[k]["bic"])
+        results["winner_aic"] = winner_aic
+        results["winner_bic"] = winner_bic
+        logger.info(f"[ModelSelection] ★ Winner (AIC): {winner_aic}")
+        logger.info(f"[ModelSelection] ★ Winner (BIC): {winner_bic}")
+        if winner_aic != winner_bic:
+            logger.info(
+                f"[ModelSelection] AIC and BIC disagree — BIC penalizes complexity harder. "
+                f"Prefer {winner_bic} if parsimony is priority."
+            )
+    else:
+        results["winner_aic"] = "N/A"
+        results["winner_bic"] = "N/A"
+
+    return results
+

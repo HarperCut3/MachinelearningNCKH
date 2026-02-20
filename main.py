@@ -44,6 +44,7 @@ from src.feature_engine import build_customer_features, sensitivity_analysis_tau
 from src.models         import (
     train_weibull_aft, train_coxph, train_logistic, rfm_segment,
     SURVIVAL_FEATURES,
+    compare_survival_distributions,  # E3
 )
 from src.simulator       import run_monte_carlo_simulation
 from src.policy         import make_intervention_decisions, rfm_intervention_decisions
@@ -69,6 +70,9 @@ from src.visualization  import (
     plot_calibration,           # D1
 )
 from src.reporter import generate_report  # D5
+from src.sensitivity import sleeping_dog_sensitivity  # E1
+from src.benchmark import run_benchmark              # E2
+import time as _time                                 # E7
 
 # Timestamped log so every run preserves its own file
 import datetime as _dt
@@ -128,6 +132,14 @@ def parse_args():
     parser.add_argument(
         "--cv", action="store_true",
         help="Run 5-fold cross-validation for survival models (slower)"
+    )
+    parser.add_argument(
+        "--sensitivity-penalty", action="store_true",
+        help="E1: Sweep sleeping_dog_penalty 5→50%% and plot robustness"
+    )
+    parser.add_argument(
+        "--benchmark", action="store_true",
+        help="E2: Run pipeline on ALL registered datasets and produce comparison table"
     )
     return parser.parse_args()
 
@@ -329,10 +341,21 @@ def main():
     # Preprocessors (imputer + scaler) are fit on df_train and then applied
     # (transform-only) to df_test to prevent any leakage across the split.
     logger.info("\n[STEP 4] Training survival models on 80% train split...")
+    _t4_start = _time.perf_counter()  # E7: runtime benchmark
 
     waf, df_scaled_train_waf, preprocessor_waf, active_features_waf = train_weibull_aft(customer_df_train)
     cph, df_scaled_train_cph, preprocessor_cph, active_features_cph = train_coxph(customer_df_train)
     lr, lr_pipeline, lr_cv_metrics = train_logistic(customer_df_train)
+    _t4_end = _time.perf_counter()
+    logger.info(f"  [Runtime] Model training: {_t4_end - _t4_start:.2f}s")
+
+    # ── E3: Model Selection Justification (AIC/BIC) ───────────────────────────
+    logger.info("\n[STEP 4-E3] Model Selection: Weibull vs Log-Normal vs Log-Logistic (AIC/BIC)...")
+    model_selection_results = {}
+    try:
+        model_selection_results = compare_survival_distributions(customer_df_train)
+    except Exception as e:
+        logger.warning(f"  Model selection comparison failed: {e}")
 
     # ── STEP 4b: Apply train-fitted preprocessors to remaining splits ──────────
     #
@@ -383,12 +406,15 @@ def main():
 
     # ── STEP 5: Intervention Policy ───────────────────────────────────────────
     logger.info("\n[STEP 5] Applying intervention policy...")
+    _t5_start = _time.perf_counter()  # E7
     t_now = float(df_scaled_waf["T"].median())
 
     weibull_decisions = make_intervention_decisions(
         waf, df_scaled_waf, customer_df, t_now=t_now
     )
     rfm_decisions = rfm_intervention_decisions(rfm_df)
+    _t5_end = _time.perf_counter()
+    logger.info(f"  [Runtime] Policy decisions (vectorized): {_t5_end - _t5_start:.3f}s")
 
     decision_path = os.path.join(REPORTS_DIR, "intervention_decisions.csv")
     weibull_decisions.to_csv(decision_path, index=False)
@@ -680,6 +706,29 @@ def main():
         logger.info(f"[D5] Report saved → {rpt_path}")
     except Exception as e:
         logger.warning(f"Report generation failed: {e}")
+
+    # ── E1: Sleeping Dog Penalty Sensitivity Analysis ────────────────────────────
+    if getattr(args, 'sensitivity_penalty', False):
+        logger.info("\n[E1] Running Sleeping Dog Penalty Sensitivity Analysis...")
+        try:
+            sens_df = sleeping_dog_sensitivity(
+                df_decisions=weibull_decisions,
+                penalties=[0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50],
+                n_mc=500,
+                save_dir=REPORTS_DIR,
+            )
+            logger.info(f"[E1] Sensitivity analysis complete — {len(sens_df)} penalty levels tested.")
+        except Exception as e:
+            logger.warning(f"[E1] Sensitivity analysis failed: {e}")
+
+    # ── E2: Multi-Dataset Benchmark (standalone mode) ───────────────────────────
+    if getattr(args, 'benchmark', False):
+        logger.info("\n[E2] Running Multi-Dataset Benchmark...")
+        try:
+            bench_df = run_benchmark(tau=args.tau)
+            logger.info(f"[E2] Benchmark complete — {len(bench_df)} datasets compared.")
+        except Exception as e:
+            logger.warning(f"[E2] Benchmark failed: {e}")
 
     logger.info("\n[DONE] Pipeline completed successfully.")
     logger.info(f"  Figures  -> {FIGURES_DIR}")

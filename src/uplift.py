@@ -262,6 +262,78 @@ def _plot_qini(qini_df: pd.DataFrame, save_path: str = None) -> plt.Figure:
 
 
 # =============================================================================
+# 5b. Cumulative Gain Chart (E5)
+# =============================================================================
+
+def _plot_cumulative_gain(
+    df: pd.DataFrame,
+    outcome_col: str = "Monetary",
+    save_path: str = None,
+) -> plt.Figure:
+    """
+    E5: Cumulative Gain Chart for uplift analysis.
+
+    X-axis : % customers targeted (sorted by uplift score descending)
+    Y-axis : cumulative % of total revenue captured
+    Compare : Model-based targeting vs Random targeting
+
+    A good uplift model captures most revenue with few contacts.
+    """
+    if "tau_hat" not in df.columns or outcome_col not in df.columns:
+        logger.warning("[CumulativeGain] Missing tau_hat or outcome column — skipping.")
+        return None
+
+    sorted_df = df.sort_values("tau_hat", ascending=False).reset_index(drop=True)
+    n = len(sorted_df)
+    total_rev = sorted_df[outcome_col].sum()
+
+    if total_rev <= 0:
+        logger.warning("[CumulativeGain] Total revenue is 0 — skipping.")
+        return None
+
+    cum_rev_model = sorted_df[outcome_col].cumsum() / total_rev * 100
+    pct_targeted = np.arange(1, n + 1) / n * 100
+    cum_rev_random = pct_targeted  # random targeting: captured % = targeted %
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(pct_targeted, cum_rev_model, color="#e74c3c", lw=2.5,
+            label="Uplift-Ranked Targeting")
+    ax.plot(pct_targeted, cum_rev_random, color="#888", lw=1.5, ls="--",
+            label="Random Targeting")
+    ax.fill_between(pct_targeted, cum_rev_model, cum_rev_random,
+                    where=cum_rev_model >= cum_rev_random,
+                    alpha=0.15, color="#e74c3c")
+
+    # Mark the point where 80% of revenue is captured
+    idx_80 = np.searchsorted(cum_rev_model.values, 80.0)
+    if idx_80 < n:
+        pct_at_80 = pct_targeted[idx_80]
+        ax.axhline(80, color="#3498db", ls=":", alpha=0.5)
+        ax.axvline(pct_at_80, color="#3498db", ls=":", alpha=0.5)
+        ax.annotate(
+            f"80% revenue at {pct_at_80:.0f}% targeted",
+            xy=(pct_at_80, 80), xytext=(pct_at_80 + 10, 70),
+            arrowprops=dict(arrowstyle="->", color="#3498db"),
+            fontsize=10, color="#3498db", fontweight="bold",
+        )
+
+    ax.set_xlabel("% Customers Targeted", fontsize=12)
+    ax.set_ylabel("% Cumulative Revenue Captured", fontsize=12)
+    ax.set_title("Cumulative Gain Chart — Uplift Model vs Random",
+                 fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.set_xlim([0, 100])
+    ax.set_ylim([0, 105])
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        logger.info(f"Saved Cumulative Gain chart → {save_path}")
+    return fig
+
+
+# =============================================================================
 # 6. Main Entry Point
 # =============================================================================
 
@@ -343,8 +415,17 @@ def run_uplift_analysis(
     qini_coef = (qini_auc / rand_auc) if rand_auc != 0 else 0.0
     logger.info("[Uplift] Qini coefficient (model AUC / random AUC): %.4f", qini_coef)
 
-    # 8. Plot
+    # 8. Plot Qini + Cumulative Gain
     _plot_qini(qini_df, save_path=save_path)
+
+    # E5: Cumulative Gain Chart
+    cum_gain_path = None
+    if save_path:
+        import os
+        cum_gain_path = save_path.replace("qini_curve", "cumulative_gain")
+        if cum_gain_path == save_path:
+            cum_gain_path = os.path.join(os.path.dirname(save_path), "cumulative_gain.png")
+    _plot_cumulative_gain(uplift_df, outcome_col="Monetary", save_path=cum_gain_path)
 
     return {
         "uplift_df":          uplift_df,

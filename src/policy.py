@@ -225,9 +225,27 @@ def make_intervention_decisions(
     is_lost      = signals["survival_now"] < theta_s
     is_intervene = (~is_lost) & (signals["hazard_now"] > theta_h) & (signals["evi"] > 0)
 
+    # E4: VIP Sleeping Dog Guard — prevent spamming high-value happy customers.
+    # If a customer has very high Monetary (top percentile) but very LOW hazard,
+    # they are a VIP who is NOT at risk → force WAIT even if EVI > 0.
+    vip_pct = _policy_cfg.get("vip_threshold_percentile", 0.90)
+    monetary_threshold = signals["Monetary"].quantile(vip_pct)
+    is_vip_sleeping_dog = (
+        (~is_lost)
+        & (signals["hazard_now"] < theta_h * 0.5)
+        & (signals["Monetary"] > monetary_threshold)
+    )
+    n_vip_guarded = is_vip_sleeping_dog.sum()
+    if n_vip_guarded > 0:
+        logger.info(
+            f"[VIP Guard] Protected {n_vip_guarded} VIP Sleeping Dogs "
+            f"(Monetary > P{vip_pct*100:.0f}={monetary_threshold:.1f}, "
+            f"hazard < {theta_h*0.5:.4f})"
+        )
+
     signals["decision"] = np.select(
-        [is_lost, is_intervene],
-        ["LOST",  "INTERVENE"],
+        [is_lost, is_vip_sleeping_dog, is_intervene],
+        ["LOST",  "WAIT",              "INTERVENE"],
         default="WAIT",
     )
 
